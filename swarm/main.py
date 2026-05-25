@@ -1,10 +1,10 @@
 """
-SwarmCoder v2 - Omnipotent conversational coding agent + parallel swarm.
+SwarmCoder v7 - Omnipotent conversational coding agent + parallel swarm.
 Inspired by: Aider (search/replace, repo map), SWE-agent (ACI tools),
              Qwen-Agent (tool registry), OpenHands (rich environment).
 """
 
-import os, sys, json, re, subprocess, difflib, urllib.request
+import os, sys, json, re, subprocess, difflib, urllib.request, tempfile, shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -67,6 +67,8 @@ _INTENT_PRIMERS: list[tuple[tuple[str, ...], str, dict]] = [
      "plan_project", {"task": "<task_description>"}),
     (("debug", "debugga", "errore", "exception", "traceback", "crash"),
      "start_debug_session", {"error_description": "<error>"}),
+    (("best of n", "best-of-n", "migliore implementazione", "5 tentativi", "parallel implementations", "migliore di"),
+     "best_of_n", {"task": "<task_description>", "n": 5}),
 ]
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -233,6 +235,41 @@ FORMAT RULES:
 - Do NOT write any function bodies or implementation code
 - Do NOT use placeholders like "# TODO" or "..."
 """
+
+COT_CODING_PROMPT = """\
+CHAIN-OF-THOUGHT PROTOCOL — mandatory before writing any code:
+
+STEP 1 — EDGE CASES: List every edge case this code must handle:
+  - Empty / null inputs
+  - Boundary values (0, -1, max int, empty string)
+  - Wrong types or malformed data
+  - Domain-specific: binary files, unicode, empty iterators, etc.
+
+STEP 2 — PSEUDOCODE: Describe the algorithm in plain English:
+  - Input → transformation steps → output
+  - Control flow (loops, branches, recursion)
+  - Error handling strategy
+
+STEP 3 — TRACE: Mentally trace through 2 test inputs:
+  - Input A (happy path): [trace] → expected output
+  - Input B (one edge case from STEP 1): [trace] → expected output
+  - If the trace reveals a flaw, revise the pseudocode BEFORE coding
+
+STEP 4 — CODE: Now write the implementation following the pseudocode exactly.
+  - Handle ALL edge cases from STEP 1
+  - Use write_file() — NEVER output code as markdown
+
+ENFORCE: You MUST output all 4 steps as text BEFORE issuing the write_file() tool call.
+Skipping steps 1-2-3 will produce incorrect code."""
+
+# 5 specialist personas for Best-of-N sampling
+_BON_SPECIALISTS = [
+    ("bon_defensive",   "You are a defensive coder. Validate ALL inputs first. Handle None, empty, boundary values, and wrong types before any logic. Your motto: 'Trust nothing, verify everything.'"),
+    ("bon_algorithmic", "You are an algorithms specialist. Choose the provably correct algorithm. Work through the logic rigorously. List invariants. Handle every branch explicitly."),
+    ("bon_tdd",         "You are a TDD practitioner. Write tests FIRST with write_file(), run them (all should fail), then write the implementation to make every test pass. Red → green."),
+    ("bon_minimal",     "You are a minimalist coder. Write the simplest code that is provably correct. Each function does ONE thing. No cleverness. Obvious beats clever."),
+    ("bon_robust",      "You are a robustness engineer. Anticipate every failure mode: malformed input, OS errors, encoding issues, empty results. Add targeted error handling. Test adversarial inputs."),
+]
 
 # Names of tools sub-agents are allowed to use
 SUB_AGENT_TOOLS_NAMES = {
@@ -1195,14 +1232,15 @@ def tool_implement_plan(plan: str = "", directory: str = "") -> str:
     task = _NOTES.get("architect_task", "implement the plan")
     print(c(CYAN, "  ↳ implementer executing plan..."), flush=True)
 
-    IMPLEMENTER_PROMPT = EXECUTOR_MANDATE + """
+    IMPLEMENTER_PROMPT = EXECUTOR_MANDATE + "\n\n" + COT_CODING_PROMPT + """
 
 You are a senior software engineer implementing an architect's plan.
 Follow the plan EXACTLY. Implement files in the specified order.
 For each file:
-1. Call write_file() with the complete implementation
-2. Call run_python() or run_shell() to verify it has no syntax errors
-3. Fix any errors immediately with edit_file()
+1. Complete the COT 4-step protocol above (edge cases → pseudocode → trace → code)
+2. Call write_file() with the complete implementation
+3. Call run_python() or run_shell() to verify it has no syntax errors
+4. Fix any errors immediately with edit_file()
 
 Do NOT deviate from the plan's interfaces — other files depend on them."""
 
@@ -1213,6 +1251,111 @@ Do NOT deviate from the plan's interfaces — other files depend on them."""
     )
 
     return result
+
+
+# ── Best-of-N sampling ───────────────────────────────────────────────────────
+
+def tool_best_of_n(task: str, n: int = 5, test_command: str = "", directory: str = ".") -> str:
+    """
+    Best-of-N sampling: run N specialists in parallel, test all, keep the winner.
+    P(at least 1 correct of 5) = 1-(error_rate)^5 ≈ 99% for 60% per-attempt accuracy.
+    """
+    n = min(max(n, 2), len(_BON_SPECIALISTS))
+    specialists = _BON_SPECIALISTS[:n]
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="swarm_bon_"))
+    candidate_dirs = []
+    for i in range(n):
+        d = tmp_root / f"candidate_{i}"
+        d.mkdir()
+        candidate_dirs.append(d)
+
+    print(c(MAGENTA, f"  ✦ best-of-{n}: spawning {n} specialists in parallel..."), flush=True)
+
+    def run_specialist(idx: int, persona: str, name: str) -> tuple:
+        agent_task = (
+            f"{task}\n\n"
+            f"IMPORTANT: Write ALL output files to this directory: {candidate_dirs[idx]}/\n"
+            f"Use absolute paths. Do NOT write to any other directory."
+        )
+        system = EXECUTOR_MANDATE + "\n\n" + COT_CODING_PROMPT + "\n\n" + persona
+        output = _run_agent_with_system(system, agent_task, context="")
+        return idx, name, output
+
+    results: list = [None] * n
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        futures = {
+            ex.submit(run_specialist, i, persona, name): i
+            for i, (name, persona) in enumerate(specialists)
+        }
+        for f in as_completed(futures):
+            idx, name, output = f.result()
+            results[idx] = (name, output)
+            print(c(GREEN, f"  ✓ [{name}] done"), flush=True)
+
+    # Score each candidate
+    scores = []
+    for i, (name, _) in enumerate(results):
+        cdir = candidate_dirs[i]
+        py_files = [f for f in cdir.rglob("*.py") if f.is_file()]
+
+        if not py_files:
+            scores.append((i, name, -100, "no files written"))
+            continue
+
+        if test_command:
+            try:
+                r = subprocess.run(
+                    test_command, shell=True, cwd=str(cdir),
+                    capture_output=True, text=True, timeout=30,
+                )
+                out = r.stdout + r.stderr
+                passes = out.lower().count("passed") + out.lower().count(" ok")
+                fails  = out.lower().count("failed") + out.lower().count("error")
+                score  = passes - fails * 2
+                detail = f"{passes} pass, {fails} fail"
+            except Exception as e:
+                score  = -10
+                detail = f"test error: {e}"
+        else:
+            score = 0
+            bad = []
+            for pyf in py_files:
+                try:
+                    compile(pyf.read_text(), str(pyf), "exec")
+                    score += 1
+                except SyntaxError:
+                    score -= 2
+                    bad.append(pyf.name)
+            detail = f"{len(py_files)} files" + (f", syntax errors: {bad}" if bad else ", all OK")
+
+        scores.append((i, name, score, detail))
+
+    scores.sort(key=lambda x: x[2], reverse=True)
+    winner_idx, winner_name, winner_score, winner_detail = scores[0]
+    winner_dir = candidate_dirs[winner_idx]
+
+    # Copy winner's files to target directory
+    target = Path(directory).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for f in winner_dir.rglob("*"):
+        if f.is_file():
+            rel = f.relative_to(winner_dir)
+            dst = target / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(f), str(dst))
+            copied.append(str(rel))
+
+    shutil.rmtree(str(tmp_root), ignore_errors=True)
+
+    lines = [f"BEST-OF-{n} RESULTS:"]
+    for idx, name, score, detail in scores:
+        marker = "WINNER" if idx == winner_idx else "      "
+        lines.append(f"  [{marker}] {name}: score={score} — {detail}")
+    lines.append(f"\nWinner: {winner_name} (score={winner_score})")
+    lines.append(f"Files deployed to {directory}: {', '.join(copied) if copied else 'none'}")
+    return "\n".join(lines)
 
 
 # ── Hypothesis Debugger tools ────────────────────────────────────────────────
@@ -1598,6 +1741,7 @@ TOOL_MAP = {
     # Architect mode
     "plan_project":            tool_plan_project,
     "implement_plan":          tool_implement_plan,
+    "best_of_n":               tool_best_of_n,
     # Hypothesis Debugger
     "start_debug_session":     tool_start_debug_session,
     "debug_hypothesis":        tool_debug_hypothesis,
@@ -1650,6 +1794,7 @@ TOOLS_SCHEMA = [
     # ── Architect mode ────────────────────────────────────────────────────
     {"type":"function","function":{"name":"plan_project","description":"ARCHITECT PHASE: Produce a complete project blueprint BEFORE writing any code. Lists all files, function signatures, imports, and implementation order. Call this first for ANY multi-file project, then call implement_plan() to execute.","parameters":{"type":"object","properties":{"task":{"type":"string","description":"What to build — be specific and complete"},"directory":{"type":"string","default":".","description":"Working directory"}},"required":["task"]}}},
     {"type":"function","function":{"name":"implement_plan","description":"EDITOR PHASE: Implement the architect plan from plan_project(). Reads the saved plan and implements each file in order, verifying each one works. Call this after plan_project().","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"The plan text (optional — if empty, reads from session notes set by plan_project)"},"directory":{"type":"string","description":"Working directory (optional — reads from session notes if empty)"}},"required":[]}}},
+    {"type":"function","function":{"name":"best_of_n","description":"BEST-OF-N SAMPLING: Run N parallel coding specialists (defensive, algorithmic, TDD, minimal, robust) each implementing the same task independently. Test all N implementations and keep the winner. P(correct) jumps from 60% to 99% with N=5. Use for critical or complex coding tasks where correctness matters most.","parameters":{"type":"object","properties":{"task":{"type":"string","description":"The coding task to implement — be specific, include file names and requirements"},"n":{"type":"integer","default":5,"description":"Number of parallel attempts (2-5, default 5)"},"test_command":{"type":"string","description":"Shell command to score each implementation, e.g. 'python -m pytest test_foo.py -v'. If empty, uses syntax checking."},"directory":{"type":"string","default":".","description":"Output directory — the best implementation files are deployed here"}},"required":["task"]}}},
     # ── Hypothesis Debugger ───────────────────────────────────────────────
     {"type":"function","function":{"name":"start_debug_session","description":"Start a structured debugging session with hypothesis tracking. ALWAYS call this first when debugging an error. Resets the hypothesis tracker and provides initial analysis.","parameters":{"type":"object","properties":{"error_description":{"type":"string","description":"Full error message and context"},"file_path":{"type":"string","description":"Path to the file with the bug (optional)"}},"required":["error_description"]}}},
     {"type":"function","function":{"name":"debug_hypothesis","description":"Test a specific debugging hypothesis with a concrete test. Tracks all attempts, detects infinite loops, and tells you if the hypothesis is CONFIRMED/REFUTED/INCONCLUSIVE. Only apply a fix after CONFIRMED.","parameters":{"type":"object","properties":{"hypothesis":{"type":"string","description":"Falsifiable hypothesis: 'The bug is in X because Y'"},"test_command":{"type":"string","description":"Shell command or test to run that validates this hypothesis"},"expected_if_true":{"type":"string","description":"What output/behavior would CONFIRM the hypothesis"}},"required":["hypothesis","test_command","expected_if_true"]}}},
@@ -1923,6 +2068,10 @@ Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {toda
     c. If HIGH risk: update ALL affected files in same session
     d. safe_rename(old, new) — for renaming across the whole project
     e. Run tests after to verify nothing broke
+12. CRITICAL CODING TASKS → use Best-of-N when correctness is paramount:
+    a. best_of_n(task, n=5, test_command="python -m pytest ...") — 5 specialists compete
+    b. Winner is selected by test results (or syntax score if no test_command)
+    c. Use when: task is complex, failures are costly, or model has struggled before
 
 ═══ AGENT SYSTEM ═══
 DYNAMIC AGENT FACTORY:
@@ -1963,6 +2112,11 @@ Multi-file project (ALWAYS use architect pattern):
 Then after reviewing the plan:
 <tool_call>
 {{"name": "implement_plan", "arguments": {{}}}}
+</tool_call>
+
+Best-of-N (critical correctness):
+<tool_call>
+{{"name": "best_of_n", "arguments": {{"task": "implement a CSV parser that handles quoted fields and unicode", "n": 5, "test_command": "python -m pytest test_csv.py -v", "directory": "./src"}}}}
 </tool_call>
 
 Chain as many tool calls as needed. Give final response as plain text when done.

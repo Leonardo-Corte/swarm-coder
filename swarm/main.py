@@ -144,6 +144,20 @@ EXECUTOR MANDATE — ABSOLUTE RULES:
 WRONG: "Here is the code: ```python def foo(): ...```"
 RIGHT: <tool_call>{"name": "write_file", "arguments": {"path": "foo.py", "content": "def foo(): ..."}}</tool_call>"""
 
+FUZZER_PROMPT = """\
+You are a hostile test generator. Given Python code, generate a standalone executable \
+Python test script that calls every public function with adversarial inputs: \
+None values, empty strings, unicode chars, negative numbers, empty lists/dicts, \
+very long strings, and domain-specific edge cases (e.g. for git parsing: binary file \
+lines with '-\\t-\\tfilename', for CSV: empty rows, missing columns).
+
+Rules:
+1. Output ONLY executable Python code — no markdown fences, no explanation
+2. Import the module using: import sys; sys.path.insert(0, '<dir>'); from <module> import *
+3. Wrap each test in try/except, print PASS or FAIL with the input that caused it
+4. Test at minimum: empty input, None input, unicode input, very large input
+5. Do NOT use pytest — plain Python only, executable with python3 script.py"""
+
 ARCHITECT_SYSTEM_PROMPT = """\
 You are an elite software architect. Your job is PLANNING ONLY — never write implementation code.
 
@@ -345,11 +359,92 @@ def tool_read_file(path: str, start_line: int = None, end_line: int = None) -> s
     numbered = "\n".join(f"{i+1:4} | {l}" for i, l in enumerate(text.splitlines()))
     return numbered
 
+def _fuzz_python_code(code: str, path: str) -> str | None:
+    """
+    Auto-generate and run adversarial tests for a Python file.
+    Returns error description if any test crashes, None if all pass or on error.
+    """
+    p = Path(path)
+    if (len(code) < 80 or "def " not in code
+            or "test_" in p.name or p.name.startswith("test")
+            or p.name == "__init__.py"):
+        return None
+
+    module_name = p.stem
+    module_dir = str(p.parent.resolve())
+
+    try:
+        resp = client.chat.completions.create(
+            model=SUB_AGENT_MODEL,
+            messages=[
+                {"role": "system", "content": FUZZER_PROMPT},
+                {"role": "user", "content": (
+                    f"Module name: {module_name}\n"
+                    f"Module dir: {module_dir}\n\n"
+                    f"Code to fuzz-test:\n{code[:3000]}"
+                )},
+            ],
+            temperature=0.7,
+            max_tokens=1500,
+        )
+        test_code = resp.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+    # Strip markdown fences if model ignored instructions
+    test_code = re.sub(r"^```python\s*|^```\s*", "", test_code, flags=re.MULTILINE)
+    test_code = re.sub(r"```\s*$", "", test_code, flags=re.MULTILINE).strip()
+
+    if len(test_code) < 20:
+        return None
+
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix="_swarm_fuzz.py", mode="w", delete=False, dir="/tmp"
+        ) as f:
+            f.write(test_code)
+            fname = f.name
+    except Exception:
+        return None
+
+    try:
+        r = subprocess.run(
+            [sys.executable, fname],
+            capture_output=True, text=True, timeout=15,
+        )
+        Path(fname).unlink(missing_ok=True)
+        output = (r.stdout + r.stderr)[:1500]
+        if r.returncode != 0 or "FAIL" in output:
+            return f"Fuzz test found issues:\n{output}"
+        return None
+    except subprocess.TimeoutExpired:
+        try: Path(fname).unlink(missing_ok=True)
+        except Exception: pass
+        return None
+    except Exception:
+        try: Path(fname).unlink(missing_ok=True)
+        except Exception: pass
+        return None
+
+
 def tool_write_file(path: str, content: str) -> str:
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return f"OK: wrote {len(content)} chars to {p}"
+    result = f"OK: wrote {len(content)} chars to {p}"
+
+    # Auto-fuzz Python files to catch edge-case bugs before user sees them
+    if p.suffix == ".py":
+        fuzz_issue = _fuzz_python_code(content, str(p))
+        if fuzz_issue:
+            result += (
+                f"\n\n⚠️  AUTO-FUZZ WARNING — adversarial tests found a crash:\n"
+                f"{fuzz_issue}\n"
+                f"Fix the edge cases above with edit_file(), then the file will be safe."
+            )
+
+    return result
 
 def tool_edit_file(path: str, old_string: str, new_string: str) -> str:
     """Surgical search-and-replace inside a file (from Aider's editblock approach)."""

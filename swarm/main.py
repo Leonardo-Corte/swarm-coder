@@ -585,6 +585,116 @@ def tool_repo_map(directory: str = ".") -> str:
 
     return "\n".join(lines_out)
 
+def tool_contract_map(directory: str = ".") -> str:
+    """
+    Generate a Contract Map via AST: function signatures, return types,
+    first-line docstrings, and inter-module import dependencies.
+    Compresses a 50K-line codebase to ~3K tokens. Perfect for cross-file refactoring.
+    Saves to session notes as 'contract_map' for automatic injection.
+    """
+    import ast as _ast
+
+    path = Path(directory).expanduser().resolve()
+    skip_dirs = {".git", "node_modules", "__pycache__", "venv", "dist", "build", ".tox"}
+
+    modules: dict[str, dict] = {}
+
+    for fpath in sorted(path.rglob("*.py")):
+        rel = fpath.relative_to(path)
+        if any(p in rel.parts for p in skip_dirs):
+            continue
+        try:
+            source = fpath.read_text(errors="replace")
+            tree = _ast.parse(source)
+        except Exception:
+            continue
+
+        exports: list[str] = []
+        imports: list[str] = []
+
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name.startswith("_"):
+                    continue
+                args_parts = []
+                for arg in node.args.args:
+                    ann = ""
+                    if arg.annotation:
+                        try:
+                            ann = f": {_ast.unparse(arg.annotation)}"
+                        except Exception:
+                            pass
+                    args_parts.append(f"{arg.arg}{ann}")
+                ret = ""
+                if node.returns:
+                    try:
+                        ret = f" -> {_ast.unparse(node.returns)}"
+                    except Exception:
+                        pass
+                doc = ""
+                if (node.body
+                        and isinstance(node.body[0], _ast.Expr)
+                        and isinstance(node.body[0].value, _ast.Constant)
+                        and isinstance(node.body[0].value.value, str)):
+                    first_line = node.body[0].value.value.strip().split("\n")[0]
+                    doc = f"  # {first_line[:70]}"
+                sig = f"def {node.name}({', '.join(args_parts)}){ret}:{doc}"
+                exports.append(f"  L{node.lineno}: {sig}")
+
+            elif isinstance(node, _ast.ClassDef) and not node.name.startswith("_"):
+                methods = []
+                for child in _ast.walk(node):
+                    if (isinstance(child, _ast.FunctionDef)
+                            and not child.name.startswith("_")):
+                        methods.append(f"    .{child.name}()")
+                exports.append(f"  L{node.lineno}: class {node.name}:")
+                exports.extend(methods[:6])
+
+            elif isinstance(node, _ast.ImportFrom) and node.module:
+                stdlib = {
+                    "os","sys","re","json","pathlib","typing","abc",
+                    "collections","functools","itertools","datetime",
+                    "subprocess","threading","concurrent","tempfile",
+                    "dataclasses","enum","copy","math","random",
+                    "hashlib","base64","io","time","string","pydantic",
+                    "openai","instructor","chromadb",
+                }
+                top = node.module.split(".")[0]
+                if top not in stdlib:
+                    names = [a.name for a in node.names]
+                    imports.append(f"  from {node.module} import {', '.join(names[:5])}")
+
+        if exports or imports:
+            modules[str(rel)] = {"exports": exports, "imports": imports}
+
+    if not modules:
+        return "No Python modules found."
+
+    lines = [
+        f"# Contract Map: {path}",
+        f"# {len(modules)} modules | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "# Shows all public interfaces + dependencies for cross-file refactoring",
+        "",
+    ]
+
+    for modfile, data in sorted(modules.items()):
+        lines.append(f"\n{'─' * 46}")
+        lines.append(f"📄 {modfile}")
+        if data["imports"]:
+            lines.append("  DEPENDS ON:")
+            lines.extend(data["imports"][:5])
+        if data["exports"]:
+            lines.append("  EXPORTS:")
+            lines.extend(data["exports"][:20])
+
+    result = "\n".join(lines)
+    tool_save_note("contract_map", result)
+
+    return (
+        result
+        + "\n\n✅ Contract map saved. Will be injected automatically in refactoring tasks."
+    )
+
 # ── Execution tools ──────────────────────────────────────────────────────────
 
 def tool_run_shell(command: str, cwd: str = None, timeout: int = 60) -> str:
@@ -1400,6 +1510,7 @@ TOOL_MAP = {
     "grep":                    tool_grep,
     "find_files":              tool_find_files,
     "repo_map":                tool_repo_map,
+    "contract_map":            tool_contract_map,
     # Execution
     "run_shell":               tool_run_shell,
     "run_python":              tool_run_python,
@@ -1457,6 +1568,7 @@ TOOLS_SCHEMA = [
     {"type":"function","function":{"name":"grep","description":"Search for a pattern in files (like grep -rn).","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","default":"."},"file_glob":{"type":"string","description":"e.g. '*.py'"},"case_sensitive":{"type":"boolean","default":True},"context_lines":{"type":"integer","default":2}},"required":["pattern"]}}},
     {"type":"function","function":{"name":"find_files","description":"Find files by name pattern.","parameters":{"type":"object","properties":{"directory":{"type":"string","default":"."},"pattern":{"type":"string","default":"*"},"file_type":{"type":"string","enum":["file","dir"],"description":"Optional filter"}},"required":[]}}},
     {"type":"function","function":{"name":"repo_map","description":"Generate a lightweight code map of the repo: all functions, classes, methods with line numbers.","parameters":{"type":"object","properties":{"directory":{"type":"string","default":"."}},"required":[]}}},
+    {"type":"function","function":{"name":"contract_map","description":"Generate a Contract Map via AST: all public function signatures with type hints, return types, docstrings, and inter-module dependencies. Compresses a 50K-line codebase to ~3K tokens. Call this BEFORE any cross-file refactoring. Saves to session for automatic injection.","parameters":{"type":"object","properties":{"directory":{"type":"string","default":".","description":"Project root directory"}},"required":[]}}},
     {"type":"function","function":{"name":"run_shell","description":"Execute a shell command. Returns stdout+stderr+exit code.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout":{"type":"integer","default":60}},"required":["command"]}}},
     {"type":"function","function":{"name":"run_python","description":"Execute Python code in a subprocess. Returns output.","parameters":{"type":"object","properties":{"code":{"type":"string"},"timeout":{"type":"integer","default":30}},"required":["code"]}}},
     {"type":"function","function":{"name":"git_status","description":"Show git status and recent log.","parameters":{"type":"object","properties":{"path":{"type":"string","default":"."}},"required":[]}}},
@@ -1661,6 +1773,15 @@ def _build_system_prompt(cwd: str = ".") -> str:
         content = swarm_md.read_text(errors="replace")[:3000]
         project_ctx = f"\n\n═══ PROJECT MEMORY (SWARM.md) ═══\n{content}"
 
+    # Inject contract map if available in session
+    contract_ctx = ""
+    if "contract_map" in _NOTES:
+        contract_ctx = (
+            "\n\n═══ CONTRACT MAP (interfaces + dependencies) ═══\n"
+            + _NOTES["contract_map"][:4000]
+            + "\n═══ END CONTRACT MAP ═══"
+        )
+
     builtin  = ", ".join(AGENTS.keys())
     custom   = ", ".join(CUSTOM_AGENTS.keys()) or "none yet"
     n_tools  = len(TOOL_MAP)
@@ -1668,7 +1789,7 @@ def _build_system_prompt(cwd: str = ".") -> str:
 
     return f"""You are SwarmCoder, an omnipotent autonomous coding agent.
 Tools: {n_tools} | Built-in agents: {builtin} | Custom agents: {custom}
-Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {today}{project_ctx}
+Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {today}{project_ctx}{contract_ctx}
 
 ═══ CORE WORKFLOW ═══
 1. PROJECT START → call analyze_project() first to understand the codebase.
@@ -1692,10 +1813,11 @@ Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {toda
     b. compare_architectures([opt1, opt2, opt3]) — score trade-offs
     c. NEVER give a single answer without comparing alternatives
 11. REFACTORING → always check impact first:
-    a. impact_analysis(file, [symbols]) — check what will break
-    b. If HIGH risk: update ALL affected files in same session
-    c. safe_rename(old, new) — for renaming across the whole project
-    d. Run tests after to verify nothing broke
+    a. contract_map() — call this FIRST to get all interfaces + dependencies
+    b. impact_analysis(file, [symbols]) — check what will break
+    c. If HIGH risk: update ALL affected files in same session
+    d. safe_rename(old, new) — for renaming across the whole project
+    e. Run tests after to verify nothing broke
 
 ═══ AGENT SYSTEM ═══
 DYNAMIC AGENT FACTORY:

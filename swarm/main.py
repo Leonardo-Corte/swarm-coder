@@ -517,9 +517,17 @@ def _fuzz_python_code(code: str, path: str) -> str | None:
         return None
 
 
+def _unescape_llm_content(content: str) -> str:
+    """Fix LLM double-encoding: literal \\n written instead of real newline.
+    Happens when model JSON-escapes content a second time inside tool arguments."""
+    if "\n" not in content and "\\n" in content:
+        content = content.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+    return content
+
 def tool_write_file(path: str, content: str) -> str:
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
+    content = _unescape_llm_content(content)
     p.write_text(content, encoding="utf-8")
     result = f"OK: wrote {len(content)} chars to {p}"
 
@@ -540,6 +548,8 @@ def tool_edit_file(path: str, old_string: str, new_string: str) -> str:
     p = Path(path).expanduser()
     if not p.exists(): return f"ERROR: not found: {p}"
     original = p.read_text(encoding="utf-8")
+    old_string = _unescape_llm_content(old_string)
+    new_string = _unescape_llm_content(new_string)
 
     # 1. Exact match
     if old_string in original:

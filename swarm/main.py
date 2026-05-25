@@ -1057,6 +1057,238 @@ def tool_debug_hypothesis(hypothesis: str, test_command: str, expected_if_true: 
     return "\n".join(output)
 
 
+# ── Constraint Reasoning tools (Fase 3) ─────────────────────────────────────
+
+CONSTRAINT_EXTRACTION_PROMPT = """\
+You are a requirements analyst. Extract ALL constraints from the problem description.
+
+Output EXACTLY this JSON structure:
+{
+  "hard_constraints": ["constraint 1", "constraint 2"],
+  "soft_constraints": ["preference 1", "preference 2"],
+  "scale": "description of expected scale/load",
+  "unknowns": ["what we don't know yet that matters"]
+}
+
+Hard constraints = must be satisfied (budget, latency SLA, specific tech required/forbidden)
+Soft constraints = preferences that can be traded off
+Be specific and extract only what's actually stated or strongly implied."""
+
+def tool_extract_constraints(problem_description: str) -> str:
+    """Extract hard/soft constraints from a problem before designing architecture."""
+    try:
+        resp = client.chat.completions.create(
+            model=ORCHESTRATOR_MODEL,
+            messages=[
+                {"role": "system", "content": CONSTRAINT_EXTRACTION_PROMPT},
+                {"role": "user", "content": problem_description},
+            ],
+            temperature=0.1,
+            max_tokens=600,
+        )
+        result = resp.choices[0].message.content.strip()
+        tool_save_note("constraints", result)
+        return f"Constraints extracted and saved:\n{result}\n\nNow call compare_architectures() with 2-3 options."
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def tool_compare_architectures(options: list, constraints: str = "") -> str:
+    """
+    Compare 2-3 architecture options against extracted constraints.
+    Returns a scored comparison matrix.
+    options: list of architecture descriptions (2-3 items)
+    constraints: constraint JSON from extract_constraints (reads from notes if empty)
+    """
+    if not constraints:
+        constraints = _NOTES.get("constraints", "No constraints extracted yet.")
+
+    options_text = "\n\n".join(f"Option {i+1}: {opt}" for i, opt in enumerate(options))
+
+    prompt = f"""Compare these architecture options against the constraints.
+
+CONSTRAINTS:
+{constraints}
+
+OPTIONS TO COMPARE:
+{options_text}
+
+For each option score 1-5 on:
+- Performance (meets latency/throughput needs)
+- Maintainability (team can own it long-term)
+- Complexity (implementation difficulty)
+- Cost (infrastructure + development)
+- Risk (probability of failure/issues)
+
+Output a markdown table + 2-sentence recommendation.
+Be specific — reference the actual constraints in your scoring."""
+
+    try:
+        resp = client.chat.completions.create(
+            model=ORCHESTRATOR_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=800,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# ── Dependency Graph tools (Fase 4) ──────────────────────────────────────────
+
+def tool_find_usages(symbol: str, directory: str = ".") -> str:
+    """
+    Find all usages of a function, class, or variable across the codebase.
+    Uses AST parsing for accuracy + grep for speed.
+    Returns: list of files + line numbers where the symbol is used.
+    """
+    import ast as ast_module
+
+    path = Path(directory).expanduser().resolve()
+    results = []
+
+    # Fast grep first to find candidate files
+    grep_result = tool_grep(symbol, str(path), file_glob="*.py", context_lines=0)
+    candidate_files = set()
+    for line in grep_result.splitlines():
+        if ":" in line:
+            parts = line.split(":", 1)
+            candidate_files.add(parts[0])
+
+    # AST verification for each candidate
+    for fpath_str in sorted(candidate_files):
+        fpath = Path(fpath_str)
+        if not fpath.exists() or not fpath.suffix == ".py":
+            continue
+        try:
+            source = fpath.read_text(errors="replace")
+            tree = ast_module.parse(source)
+            for node in ast_module.walk(tree):
+                # Check Name nodes (variable/function calls)
+                if isinstance(node, ast_module.Name) and node.id == symbol:
+                    results.append(f"  {fpath.relative_to(path)}:{node.lineno} — usage")
+                # Check Attribute nodes (method calls)
+                elif isinstance(node, ast_module.Attribute) and node.attr == symbol:
+                    results.append(f"  {fpath.relative_to(path)}:{node.lineno} — attribute access")
+                # Check Import nodes
+                elif isinstance(node, (ast_module.Import, ast_module.ImportFrom)):
+                    for alias in getattr(node, 'names', []):
+                        if alias.name == symbol or alias.asname == symbol:
+                            results.append(f"  {fpath.relative_to(path)}:{node.lineno} — import")
+        except Exception:
+            # Fall back to grep result for this file
+            for line in grep_result.splitlines():
+                if fpath_str in line:
+                    results.append(f"  {line.strip()}")
+
+    if not results:
+        return f"No usages of '{symbol}' found in {path}"
+
+    return f"Usages of '{symbol}' ({len(results)} found):\n" + "\n".join(results[:50])
+
+
+def tool_impact_analysis(file_path: str, symbols_to_change: list) -> str:
+    """
+    Before refactoring: analyze what will break if you modify these symbols.
+    Returns: risk assessment + list of affected files.
+    Call this BEFORE modifying any public function/class in a shared module.
+    """
+    p = Path(file_path).expanduser()
+    if not p.exists():
+        return f"ERROR: file not found: {file_path}"
+
+    directory = str(p.parent.parent) if p.parent != p.parent.parent else str(p.parent)
+    all_usages = []
+    affected_files = set()
+
+    for symbol in symbols_to_change:
+        usage_result = tool_find_usages(symbol, directory)
+        all_usages.append(f"\n{symbol}:\n{usage_result}")
+        # Extract file names from usages
+        for line in usage_result.splitlines():
+            if line.strip().startswith("  ") and ":" in line:
+                fname = line.strip().split(":")[0]
+                if fname != str(p.relative_to(Path(directory))):
+                    affected_files.add(fname)
+
+    risk = "HIGH" if len(affected_files) > 3 else ("MEDIUM" if len(affected_files) > 0 else "LOW")
+
+    output = [
+        f"Impact Analysis for: {file_path}",
+        f"Symbols to change: {symbols_to_change}",
+        f"Risk level: {risk}",
+        f"Files that will be affected ({len(affected_files)}):",
+    ]
+    for f in sorted(affected_files):
+        output.append(f"  ⚠️  {f}")
+    output.append("\nUsage details:")
+    output.extend(all_usages)
+
+    if risk == "HIGH":
+        output.append("\n🛑 HIGH RISK: Update ALL affected files in the same edit session. Run tests after.")
+    elif risk == "MEDIUM":
+        output.append("\n⚠️  MEDIUM RISK: Check affected files before committing.")
+    else:
+        output.append("\n✅ LOW RISK: Symbol appears to be internal only.")
+
+    return "\n".join(output)
+
+
+def tool_safe_rename(old_name: str, new_name: str, directory: str = ".") -> str:
+    """
+    Safely rename a function/class/variable across ALL files in the project.
+    First finds all usages, then updates each file, then verifies.
+    """
+    import re as re_module
+    path = Path(directory).expanduser().resolve()
+
+    # Step 1: find all usages
+    usage_result = tool_find_usages(old_name, str(path))
+    affected_lines = [l.strip() for l in usage_result.splitlines() if l.strip().startswith("  ")]
+
+    if not affected_lines:
+        return f"No usages of '{old_name}' found. Nothing to rename."
+
+    # Step 2: collect unique files
+    affected_files = set()
+    for line in affected_lines:
+        fname = line.split(":")[0].strip()
+        if fname:
+            affected_files.add(fname)
+
+    # Step 3: replace in each file
+    updated = []
+    errors = []
+    for fname in sorted(affected_files):
+        fpath = path / fname
+        if not fpath.exists():
+            continue
+        try:
+            original = fpath.read_text(encoding="utf-8")
+            updated_content = re_module.sub(
+                r'\b' + re_module.escape(old_name) + r'\b',
+                new_name,
+                original
+            )
+            if updated_content != original:
+                fpath.write_text(updated_content, encoding="utf-8")
+                count = len(re_module.findall(r'\b' + re_module.escape(new_name) + r'\b', updated_content))
+                updated.append(f"  ✓ {fname} ({count} replacements)")
+        except Exception as e:
+            errors.append(f"  ✗ {fname}: {e}")
+
+    result = [
+        f"Safe rename: '{old_name}' → '{new_name}'",
+        f"Files updated ({len(updated)}):",
+        *updated,
+    ]
+    if errors:
+        result.extend([f"Errors ({len(errors)}):", *errors])
+    result.append("\nNext: run your tests to verify nothing broke.")
+    return "\n".join(result)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TOOL REGISTRY & DISPATCHER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1111,6 +1343,13 @@ TOOL_MAP = {
     # Hypothesis Debugger
     "start_debug_session":     tool_start_debug_session,
     "debug_hypothesis":        tool_debug_hypothesis,
+    # Constraint Reasoning (Fase 3)
+    "extract_constraints":     tool_extract_constraints,
+    "compare_architectures":   tool_compare_architectures,
+    # Dependency Graph (Fase 4)
+    "find_usages":             tool_find_usages,
+    "impact_analysis":         tool_impact_analysis,
+    "safe_rename":             tool_safe_rename,
 }
 
 TOOLS_SCHEMA = [
@@ -1155,6 +1394,13 @@ TOOLS_SCHEMA = [
     # ── Hypothesis Debugger ───────────────────────────────────────────────
     {"type":"function","function":{"name":"start_debug_session","description":"Start a structured debugging session with hypothesis tracking. ALWAYS call this first when debugging an error. Resets the hypothesis tracker and provides initial analysis.","parameters":{"type":"object","properties":{"error_description":{"type":"string","description":"Full error message and context"},"file_path":{"type":"string","description":"Path to the file with the bug (optional)"}},"required":["error_description"]}}},
     {"type":"function","function":{"name":"debug_hypothesis","description":"Test a specific debugging hypothesis with a concrete test. Tracks all attempts, detects infinite loops, and tells you if the hypothesis is CONFIRMED/REFUTED/INCONCLUSIVE. Only apply a fix after CONFIRMED.","parameters":{"type":"object","properties":{"hypothesis":{"type":"string","description":"Falsifiable hypothesis: 'The bug is in X because Y'"},"test_command":{"type":"string","description":"Shell command or test to run that validates this hypothesis"},"expected_if_true":{"type":"string","description":"What output/behavior would CONFIRM the hypothesis"}},"required":["hypothesis","test_command","expected_if_true"]}}},
+    # ── Constraint Reasoning (Fase 3) ─────────────────────────────────────
+    {"type":"function","function":{"name":"extract_constraints","description":"Extract hard and soft constraints from a problem description before designing architecture. Always call this first for architecture/design questions. Saves constraints for use by compare_architectures().","parameters":{"type":"object","properties":{"problem_description":{"type":"string","description":"Full description of the problem to solve, including any stated requirements"}},"required":["problem_description"]}}},
+    {"type":"function","function":{"name":"compare_architectures","description":"Compare 2-3 architecture options against extracted constraints. Returns a scored matrix and recommendation. Call after extract_constraints().","parameters":{"type":"object","properties":{"options":{"type":"array","items":{"type":"string"},"description":"List of 2-3 architecture options to compare (each a 1-2 sentence description)"},"constraints":{"type":"string","description":"Constraint JSON from extract_constraints (optional — reads from session notes if empty)"}},"required":["options"]}}},
+    # ── Dependency Graph (Fase 4) ─────────────────────────────────────────
+    {"type":"function","function":{"name":"find_usages","description":"Find all usages of a function, class, or variable across the codebase using AST + grep. Returns file paths and line numbers.","parameters":{"type":"object","properties":{"symbol":{"type":"string","description":"Function, class, or variable name to search for"},"directory":{"type":"string","default":".","description":"Root directory to search in"}},"required":["symbol"]}}},
+    {"type":"function","function":{"name":"impact_analysis","description":"Before refactoring: analyze what files/code will break if you modify these symbols. Returns risk level (HIGH/MEDIUM/LOW) and list of affected files. ALWAYS call before modifying public functions or classes.","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"File you plan to modify"},"symbols_to_change":{"type":"array","items":{"type":"string"},"description":"List of function/class names you plan to change"}},"required":["file_path","symbols_to_change"]}}},
+    {"type":"function","function":{"name":"safe_rename","description":"Rename a function, class, or variable across ALL files in the project. Uses AST-aware word-boundary matching. Updates all files atomically and reports changes.","parameters":{"type":"object","properties":{"old_name":{"type":"string","description":"Current name"},"new_name":{"type":"string","description":"New name"},"directory":{"type":"string","default":".","description":"Project root directory"}},"required":["old_name","new_name"]}}},
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS_SCHEMA}
@@ -1346,6 +1592,15 @@ Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {toda
    b. debug_hypothesis(hypothesis, test, expected) — test each theory
    c. NEVER apply a fix before hypothesis is CONFIRMED
    d. NEVER repeat same hypothesis — tracker prevents this
+10. ARCHITECTURE DECISIONS → always structure the reasoning:
+    a. extract_constraints(problem) — identify hard/soft constraints
+    b. compare_architectures([opt1, opt2, opt3]) — score trade-offs
+    c. NEVER give a single answer without comparing alternatives
+11. REFACTORING → always check impact first:
+    a. impact_analysis(file, [symbols]) — check what will break
+    b. If HIGH risk: update ALL affected files in same session
+    c. safe_rename(old, new) — for renaming across the whole project
+    d. Run tests after to verify nothing broke
 
 ═══ AGENT SYSTEM ═══
 DYNAMIC AGENT FACTORY:
@@ -1536,7 +1791,7 @@ def _print_banner():
 Orchestrator : {YELLOW}{ORCHESTRATOR_MODEL}{R}
 Sub-agents   : {YELLOW}{SUB_AGENT_MODEL}{R}
 Tools        : {GREEN}{len(TOOL_MAP)}{R}  Built-in agents: {GREEN}{len(AGENTS)}{R}  Custom agents: {MAGENTA}{custom_count}{R}
-Intelligence : {GREEN}instructor + reflexion + RAG + architect + hypothesis debugger{R}
+Intelligence : {GREEN}architect + hypothesis debugger + constraint reasoning + dependency graph{R}
 {DIM}
 Commands:
   /exit            quit

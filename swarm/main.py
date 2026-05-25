@@ -50,14 +50,31 @@ _NOTES: dict[str, str] = {}
 
 # ── Built-in sub-agent personas ────────────────────────────────────────────
 AGENTS = {
-    "architect":   "Expert software architect. Produce clear plans: components, interfaces, file structure, implementation order.",
-    "implementer": "Senior engineer. Write complete, production-ready code. All imports included. No placeholders.",
-    "reviewer":    "Code reviewer. Find bugs, security issues, performance problems, missing edge cases. Numbered findings.",
-    "tester":      "QA engineer. Write comprehensive pytest tests: unit, edge cases, integration. With fixtures.",
-    "optimizer":   "Performance engineer. Improve time/space complexity and readability without changing behavior.",
-    "debugger":    "Debugging expert. Trace root causes from errors and provide exact, minimal fixes.",
-    "documenter":  "Technical writer. Write concise docstrings, README sections, and API docs. Markdown format.",
-    "security":    "Security engineer. Identify OWASP top-10, injection, auth flaws, secrets exposure. Be specific.",
+    "architect":   "You are an elite software architect. Produce clear implementation plans: components, interfaces, file structure, ordered steps. Save your plan with save_note(). Be decisive and specific.",
+    "implementer": "You are a senior software engineer and EXECUTOR. Write complete production-ready code and write every file to disk using write_file(). Never output code as text. After writing: verify with run_shell() or run_python(). Fix any failures immediately.",
+    "reviewer":    "You are a rigorous code reviewer. Read all relevant files with read_file(), then list numbered findings: bugs, security issues, performance problems, missing edge cases. Be specific with file:line references.",
+    "tester":      "You are a QA engineer and EXECUTOR. Write comprehensive pytest tests covering unit tests, edge cases, and integration. Write the test file to disk with write_file(), then run with run_shell('python -m pytest ...'). Report pass/fail.",
+    "optimizer":   "You are a performance engineer. Read code with read_file(), identify bottlenecks, then use edit_file() to apply improvements without changing behavior. Run benchmarks to verify speedup.",
+    "debugger":    "You are a debugging expert. Read error messages and code with read_file(). Trace root causes precisely. Apply minimal fixes with edit_file(). Re-run to confirm the fix works.",
+    "documenter":  "You are a technical writer. Read code with read_file() and write concise docstrings, README sections, and API docs to disk with write_file(). Markdown format. Clear and accurate.",
+    "security":    "You are a security engineer. Read all code with read_file(). Identify OWASP top-10 issues, injection flaws, auth bypasses, secrets exposure. Report with file:line references and exact fix recommendations.",
+}
+
+EXECUTOR_MANDATE = """\
+EXECUTOR MANDATE — ABSOLUTE RULES:
+1. NEVER output code as markdown to the user. Code MUST go to disk via write_file().
+2. When you produce code for any file: call write_file() IMMEDIATELY — no preamble.
+3. After writing files: call run_shell() or run_python() to verify they work.
+4. Only respond in plain text AFTER all files are written AND verified.
+5. If tests fail: fix with edit_file() and re-run. Never give up after one failure.
+WRONG: "Here is the code: ```python def foo(): ...```"
+RIGHT: <tool_call>{"name": "write_file", "arguments": {"path": "foo.py", "content": "def foo(): ..."}}</tool_call>"""
+
+# Names of tools sub-agents are allowed to use
+SUB_AGENT_TOOLS_NAMES = {
+    "read_file", "write_file", "edit_file", "append_file", "list_directory",
+    "grep", "find_files", "run_shell", "run_python",
+    "git_status", "git_diff", "save_note", "get_note",
 }
 
 # ── Dynamic custom agents (created at runtime by the user) ─────────────────
@@ -88,16 +105,85 @@ def _get_system(name: str) -> str | None:
     return None
 
 def _run_agent_with_system(system: str, task: str, context: str = "") -> str:
+    """Run a sub-agent with a full tool-calling loop (up to 12 iterations)."""
+    # SUB_AGENT_TOOLS is defined after TOOLS_SCHEMA — access lazily via module globals
+    sub_tools = globals().get("SUB_AGENT_TOOLS", [])
+    full_system = EXECUTOR_MANDATE + "\n\n" + system
     user = f"Context:\n{context}\n\nTask:\n{task}" if context else task
-    try:
-        resp = client.chat.completions.create(
-            model=SUB_AGENT_MODEL,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.25, max_tokens=4096,
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        return f"ERROR: {e}"
+    messages = [
+        {"role": "system", "content": full_system},
+        {"role": "user",   "content": user},
+    ]
+    output_parts = []
+    MAX_SUB_ITER = 12
+    for iteration in range(MAX_SUB_ITER):
+        try:
+            kwargs = dict(
+                model=SUB_AGENT_MODEL,
+                messages=messages,
+                temperature=0.25,
+                max_tokens=4096,
+            )
+            if sub_tools:
+                kwargs["tools"] = sub_tools
+                kwargs["tool_choice"] = "auto"
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            return f"ERROR: {e}"
+
+        msg = resp.choices[0].message
+        content = msg.content or ""
+
+        # ── Layer 1: Native structured tool_calls ─────────────────────────
+        if getattr(msg, "tool_calls", None):
+            messages.append({
+                "role": "assistant", "content": content,
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ],
+            })
+            for tc in msg.tool_calls:
+                fn = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments)
+                except Exception:
+                    args = {}
+                print(c(DIM, f"    [sub-tool] {fn}({_fmt_args(args)})"), flush=True)
+                result = dispatch(fn, args)
+                short = result[:200].replace("\n", " ")
+                print(c(DIM, f"    [sub-tool] → {short}"), flush=True)
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                  "content": result[:MAX_SHELL_CHARS]})
+            continue
+
+        # ── Layer 2: XML/JSON tool call in text ───────────────────────────
+        parsed_calls = _parse_tool_from_text(content)
+        if parsed_calls:
+            fake_tool_calls = []
+            for pc in parsed_calls:
+                fid = f"sub_call_{pc['name']}_{iteration}"
+                fake_tool_calls.append({
+                    "id": fid, "type": "function",
+                    "function": {"name": pc["name"], "arguments": json.dumps(pc["arguments"])}
+                })
+            messages.append({"role": "assistant", "content": "", "tool_calls": fake_tool_calls})
+            for pc, ftc in zip(parsed_calls, fake_tool_calls):
+                print(c(DIM, f"    [sub-tool²] {pc['name']}({_fmt_args(pc['arguments'])})"), flush=True)
+                result = dispatch(pc["name"], pc["arguments"])
+                short = result[:200].replace("\n", " ")
+                print(c(DIM, f"    [sub-tool²] → {short}"), flush=True)
+                messages.append({"role": "tool", "tool_call_id": ftc["id"],
+                                  "content": result[:MAX_SHELL_CHARS]})
+            continue
+
+        # ── Layer 3: Plain text — sub-agent is done ───────────────────────
+        if content:
+            output_parts.append(content)
+        return "\n\n".join(output_parts) if output_parts else content
+
+    return "\n\n".join(output_parts) or "ERROR: sub-agent reached max iterations."
 
 # ─── META-PROMPT for agent creation ────────────────────────────────────────
 
@@ -430,15 +516,11 @@ def tool_analyze_project(directory: str, max_depth: int = 3) -> str:
 # ── Sub-agent tools ───────────────────────────────────────────────────────────
 
 def _run_agent(agent: str, task: str, context: str = "") -> dict:
+    """Run a named sub-agent with the full tool-calling loop."""
     system = _get_system(agent) or AGENTS["implementer"]
-    user = f"Context:\n{context}\n\nTask:\n{task}" if context else task
     try:
-        resp = client.chat.completions.create(
-            model=SUB_AGENT_MODEL,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.2, max_tokens=4096,
-        )
-        return {"agent": agent, "output": resp.choices[0].message.content, "error": None}
+        output = _run_agent_with_system(system, task, context)
+        return {"agent": agent, "output": output, "error": None}
     except Exception as e:
         return {"agent": agent, "output": None, "error": str(e)}
 
@@ -675,6 +757,10 @@ TOOLS_SCHEMA = [
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS_SCHEMA}
 
+# ── Sub-agent tool schema (subset of TOOLS_SCHEMA) ────────────────────────
+# Built lazily after TOOLS_SCHEMA is complete; used by _run_agent_with_system
+SUB_AGENT_TOOLS = [t for t in TOOLS_SCHEMA if t["function"]["name"] in SUB_AGENT_TOOLS_NAMES]
+
 def dispatch(name: str, args: dict) -> str:
     fn = TOOL_MAP.get(name)
     if not fn: return f"ERROR: unknown tool '{name}'"
@@ -761,6 +847,39 @@ def _parse_tool_from_text(text: str) -> list[dict]:
 
     return calls
 
+
+def _extract_code_blocks_and_write(text: str, cwd: str) -> list[str]:
+    """
+    When the model returns code in markdown instead of using write_file,
+    auto-extract code blocks with filename hints and write them to disk.
+    Returns list of written paths.
+    """
+    written = []
+    # Pattern: optional filename before a fenced code block
+    pattern = re.compile(
+        r'(?:^|\n)'                              # start of line
+        r'(?:[*#`\s]*)?'                         # optional formatting
+        r'([\w./\-]+\.(?:py|js|ts|go|rs|sh|yaml|json|toml|md|txt))'  # filename
+        r'[:`*\s]*\n'                            # separator
+        r'```(?:\w+)?\n([\s\S]+?)```',           # fenced code block
+        re.MULTILINE
+    )
+    for m in pattern.finditer(text):
+        filename = m.group(1).strip()
+        code = m.group(2)
+        # Skip filenames that look like random words
+        if '/' not in filename and '.' not in filename:
+            continue
+        path = Path(cwd) / filename
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(code, encoding="utf-8")
+            written.append(str(path))
+        except Exception:
+            pass
+    return written
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SYSTEM PROMPT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -825,8 +944,12 @@ Roundtable:
 
 Chain as many tool calls as needed. Give final response as plain text when done.
 
+═══ EXECUTOR MANDATE ═══
+{EXECUTOR_MANDATE}
+
 ═══ PRINCIPLES ═══
-- Read before writing. Minimal edits. Verify after changes. Parallel when independent. Autonomous."""
+- Read before writing. Minimal edits. Verify after changes. Parallel when independent.
+- NEVER output code as text. ALWAYS write_file() + run_shell() to verify. You are an EXECUTOR."""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AGENT TURN
@@ -884,6 +1007,23 @@ def agent_turn(history: list, cwd: str = ".") -> str:
             continue
 
         # ── Layer 3: Plain text reply ─────────────────────────────────────
+        # If the model outputted code in markdown instead of using write_file,
+        # auto-extract and write those files, then continue the loop.
+        if content:
+            written = _extract_code_blocks_and_write(content, cwd)
+            if written:
+                file_list = "\n".join(f"  - {p}" for p in written)
+                print(c(YELLOW, f"  ⚡ auto-wrote {len(written)} file(s) from response"), flush=True)
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Files auto-extracted and written to disk:\n{file_list}\n\n"
+                        "Now run them to verify they work. Use run_shell or run_python. "
+                        "If tests pass, confirm completion. If errors, fix with edit_file and re-run."
+                    )
+                })
+                continue
         return content
 
     return "ERROR: reached max iterations without final reply."

@@ -96,11 +96,36 @@ EXECUTOR MANDATE — ABSOLUTE RULES:
 WRONG: "Here is the code: ```python def foo(): ...```"
 RIGHT: <tool_call>{"name": "write_file", "arguments": {"path": "foo.py", "content": "def foo(): ..."}}</tool_call>"""
 
+ARCHITECT_SYSTEM_PROMPT = """\
+You are an elite software architect. Your job is PLANNING ONLY — never write implementation code.
+
+Given a coding task, produce a complete project blueprint:
+
+1. FILE STRUCTURE — list every file to create with exact path:
+   - path/to/file.py — one-line description of its role
+
+2. MODULE INTERFACES — for each file, specify:
+   - Functions/classes it exposes (name, params, return type)
+   - What it imports from other modules in this project
+
+3. IMPLEMENTATION ORDER — numbered list of files in dependency order
+   (files with no internal deps first)
+
+4. KEY DECISIONS — 2-3 architectural choices made and why
+
+FORMAT RULES:
+- Use exact Python syntax for signatures: def foo(x: int, y: str) -> list[str]:
+- Be complete — the implementer will follow this exactly, cannot ask questions
+- Do NOT write any function bodies or implementation code
+- Do NOT use placeholders like "# TODO" or "..."
+"""
+
 # Names of tools sub-agents are allowed to use
 SUB_AGENT_TOOLS_NAMES = {
     "read_file", "write_file", "edit_file", "append_file", "list_directory",
     "grep", "find_files", "run_shell", "run_python",
     "git_status", "git_diff", "save_note", "get_note",
+    "plan_project", "implement_plan",
 }
 
 # ── Dynamic custom agents (created at runtime by the user) ─────────────────
@@ -806,6 +831,85 @@ def _reflect_on_task(user_msg: str, assistant_reply: str, cwd: str) -> str | Non
     except Exception:
         return None
 
+# ── Architect mode tools ─────────────────────────────────────────────────────
+
+def tool_plan_project(task: str, directory: str = ".") -> str:
+    """
+    Architect phase: produce a complete file structure + interface plan BEFORE writing any code.
+    Always call this before implement_plan() for multi-file projects.
+    """
+    print(c(MAGENTA, "  ✦ architect planning..."), flush=True)
+
+    # Read existing project context
+    ctx_parts = []
+    path = Path(directory).expanduser().resolve()
+    if path.exists():
+        # Add repo map for context
+        repo = tool_repo_map(directory)
+        if "No code symbols" not in repo:
+            ctx_parts.append(f"Existing codebase:\n{repo[:2000]}")
+
+    context = "\n\n".join(ctx_parts) if ctx_parts else "New project — no existing code."
+
+    try:
+        resp = client.chat.completions.create(
+            model=ORCHESTRATOR_MODEL,
+            messages=[
+                {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Context:\n{context}\n\nTask:\n{task}"},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        plan = resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"ERROR in architect planning: {e}"
+
+    # Save plan to session notes
+    tool_save_note("architect_plan", plan)
+    tool_save_note("architect_task", task)
+    tool_save_note("architect_dir", directory)
+
+    print(c(GREEN, "  ✓ architect plan ready"), flush=True)
+    return f"ARCHITECT PLAN:\n{'─'*50}\n{plan}\n{'─'*50}\nPlan saved. Now call implement_plan() to execute it."
+
+
+def tool_implement_plan(plan: str = "", directory: str = "") -> str:
+    """
+    Editor phase: implement the architect's plan file by file.
+    If plan is empty, reads from session notes (set by plan_project).
+    """
+    # Load from notes if not provided
+    if not plan:
+        plan = _NOTES.get("architect_plan", "")
+    if not directory:
+        directory = _NOTES.get("architect_dir", ".")
+    if not plan:
+        return "ERROR: no plan found. Call plan_project() first."
+
+    task = _NOTES.get("architect_task", "implement the plan")
+    print(c(CYAN, "  ↳ implementer executing plan..."), flush=True)
+
+    IMPLEMENTER_PROMPT = EXECUTOR_MANDATE + """
+
+You are a senior software engineer implementing an architect's plan.
+Follow the plan EXACTLY. Implement files in the specified order.
+For each file:
+1. Call write_file() with the complete implementation
+2. Call run_python() or run_shell() to verify it has no syntax errors
+3. Fix any errors immediately with edit_file()
+
+Do NOT deviate from the plan's interfaces — other files depend on them."""
+
+    result = _run_agent_with_system(
+        system=IMPLEMENTER_PROMPT,
+        task=f"Implement this architect plan:\n\n{plan}\n\nOriginal task: {task}\nWorking directory: {directory}",
+        context="",
+    )
+
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TOOL REGISTRY & DISPATCHER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -854,6 +958,9 @@ TOOL_MAP = {
     # Semantic search (ChromaDB)
     "index_codebase":          tool_index_codebase,
     "semantic_search":         tool_semantic_search,
+    # Architect mode
+    "plan_project":            tool_plan_project,
+    "implement_plan":          tool_implement_plan,
 }
 
 TOOLS_SCHEMA = [
@@ -892,6 +999,9 @@ TOOLS_SCHEMA = [
     # ── Semantic search (ChromaDB) ────────────────────────────────────────
     {"type":"function","function":{"name":"index_codebase","description":"Index the entire codebase into a local vector database for semantic search. Run this once per project before using semantic_search.","parameters":{"type":"object","properties":{"directory":{"type":"string","default":"."}},"required":[]}}},
     {"type":"function","function":{"name":"semantic_search","description":"Semantic search over the indexed codebase. Finds conceptually related code even without exact keyword match. E.g. 'authentication logic', 'database connection', 'error handling'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Natural language description of code to find"},"n_results":{"type":"integer","default":5},"directory":{"type":"string","default":"."}},"required":["query"]}}},
+    # ── Architect mode ────────────────────────────────────────────────────
+    {"type":"function","function":{"name":"plan_project","description":"ARCHITECT PHASE: Produce a complete project blueprint BEFORE writing any code. Lists all files, function signatures, imports, and implementation order. Call this first for ANY multi-file project, then call implement_plan() to execute.","parameters":{"type":"object","properties":{"task":{"type":"string","description":"What to build — be specific and complete"},"directory":{"type":"string","default":".","description":"Working directory"}},"required":["task"]}}},
+    {"type":"function","function":{"name":"implement_plan","description":"EDITOR PHASE: Implement the architect plan from plan_project(). Reads the saved plan and implements each file in order, verifying each one works. Call this after plan_project().","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"The plan text (optional — if empty, reads from session notes set by plan_project)"},"directory":{"type":"string","description":"Working directory (optional — reads from session notes if empty)"}},"required":[]}}},
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS_SCHEMA}
@@ -1070,10 +1180,14 @@ Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {toda
 1. PROJECT START → call analyze_project() first to understand the codebase.
 2. EXPLORATION → grep, find_files, repo_map, read_file to understand details.
 3. PLANNING → save_note("task_plan", "...") to record your numbered step plan.
-4. EXECUTION → work step by step, using tools to read/write/run/test.
-5. EDITING → ALWAYS prefer edit_file (surgical) over write_file (full rewrite).
-6. VERIFICATION → after writing code, run it with run_python or run_shell.
-7. GIT → commit progress at logical milestones with git_commit.
+4. MULTI-FILE TASKS → ALWAYS use two-pass architect pattern:
+   a. plan_project(task) — architect designs complete file structure + interfaces
+   b. implement_plan()   — editor implements file by file in order
+   NEVER write multi-file code without planning first.
+5. EXECUTION → work step by step, using tools to read/write/run/test.
+6. EDITING → ALWAYS prefer edit_file (surgical) over write_file (full rewrite).
+7. VERIFICATION → after writing code, run it with run_python or run_shell.
+8. GIT → commit progress at logical milestones with git_commit.
 
 ═══ AGENT SYSTEM ═══
 DYNAMIC AGENT FACTORY:
@@ -1105,6 +1219,15 @@ Parallel agents:
 Roundtable:
 <tool_call>
 {{"name": "agent_roundtable", "arguments": {{"agents": ["ios_llm_engineer", "ux_funnel_designer"], "task": "design the onboarding flow", "rounds": 2}}}}
+</tool_call>
+
+Multi-file project (ALWAYS use architect pattern):
+<tool_call>
+{{"name": "plan_project", "arguments": {{"task": "create a REST API with auth, models, and tests", "directory": "./my_api"}}}}
+</tool_call>
+Then after reviewing the plan:
+<tool_call>
+{{"name": "implement_plan", "arguments": {{}}}}
 </tool_call>
 
 Chain as many tool calls as needed. Give final response as plain text when done.
@@ -1225,12 +1348,12 @@ def _print_banner():
     custom_count = len(CUSTOM_AGENTS)
     print(f"""{BOLD}{CYAN}
 ╔══════════════════════════════════════════════════╗
-║   SwarmCoder v4  —  Omnipotent Coding Agent      ║
+║   SwarmCoder v5  —  Omnipotent Coding Agent      ║
 ╚══════════════════════════════════════════════════╝{R}
 Orchestrator : {YELLOW}{ORCHESTRATOR_MODEL}{R}
 Sub-agents   : {YELLOW}{SUB_AGENT_MODEL}{R}
 Tools        : {GREEN}{len(TOOL_MAP)}{R}  Built-in agents: {GREEN}{len(AGENTS)}{R}  Custom agents: {MAGENTA}{custom_count}{R}
-Intelligence : {GREEN}instructor + reflexion + semantic RAG{R}
+Intelligence : {GREEN}instructor + reflexion + semantic RAG + architect mode{R}
 {DIM}
 Commands:
   /exit            quit

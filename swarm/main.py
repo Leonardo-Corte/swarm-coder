@@ -9,6 +9,13 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import Any
+
+# ── Instructor structured extraction model ──────────────────────────────────
+class ToolCallExtract(BaseModel):
+    name: str = Field(description="Name of the tool to call")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
 
 # ── Config ─────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL    = os.environ.get("SWARM_BASE_URL", "http://localhost:11434/v1")
@@ -19,6 +26,21 @@ SUB_AGENT_MODEL    = os.environ.get("SWARM_SUB_MODEL", "qwen2.5-coder:14b")
 MAX_FILE_CHARS     = 12000
 MAX_SHELL_CHARS    = 6000
 MAX_ITERATIONS     = 30
+
+# ── Reflexion prompt ────────────────────────────────────────────────────────
+REFLEXION_PROMPT = """\
+You just completed a task. Reflect critically and briefly:
+1. What worked well?
+2. What mistakes or inefficiencies occurred?
+3. What would you do differently next time?
+4. Any project-specific patterns or gotchas to remember?
+
+Be specific and concise. Max 150 words. Write as bullet points.
+Format your response as:
+## Learnings — {date}
+- [learning 1]
+- [learning 2]
+..."""
 
 # ── History persistence ─────────────────────────────────────────────────────
 HISTORY_FILE = Path.home() / ".swarm_history.json"
@@ -38,6 +60,10 @@ def _load_history(path: Path = HISTORY_FILE) -> list:
     return []
 
 client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
+
+# ── ChromaDB globals (lazy-init) ────────────────────────────────────────────
+_CHROMA_CLIENT = None
+_CHROMA_COLLECTION = None
 
 # ── Colors ─────────────────────────────────────────────────────────────────
 R="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
@@ -673,6 +699,113 @@ def tool_agent_roundtable(agents: list, task: str,
         out_lines.append("─" * 50)
     return "\n".join(out_lines)
 
+# ── ChromaDB semantic search tools ──────────────────────────────────────────
+
+def _get_or_create_chroma(cwd: str):
+    """Lazy-init ChromaDB collection for the current project."""
+    global _CHROMA_CLIENT, _CHROMA_COLLECTION
+    import chromadb
+    from chromadb.utils import embedding_functions
+
+    db_path = Path.home() / ".swarm_chroma" / Path(cwd).name
+    db_path.mkdir(parents=True, exist_ok=True)
+
+    _CHROMA_CLIENT = chromadb.PersistentClient(path=str(db_path))
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    )
+    _CHROMA_COLLECTION = _CHROMA_CLIENT.get_or_create_collection(
+        name="codebase", embedding_function=ef
+    )
+    return _CHROMA_COLLECTION
+
+def tool_index_codebase(directory: str = ".") -> str:
+    """Index all code files into ChromaDB for semantic search."""
+    path = Path(directory).expanduser().resolve()
+    coll = _get_or_create_chroma(str(path))
+
+    extensions = {".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h"}
+    skip_dirs = {".git", "node_modules", "__pycache__", "venv", "dist", "build"}
+
+    docs, ids, metas = [], [], []
+    for fpath in sorted(path.rglob("*")):
+        if fpath.suffix not in extensions:
+            continue
+        if any(s in fpath.parts for s in skip_dirs):
+            continue
+        try:
+            text = fpath.read_text(errors="replace")
+            if len(text) < 10:
+                continue
+            # Chunk into 50-line segments
+            lines = text.splitlines()
+            for i in range(0, len(lines), 50):
+                chunk = "\n".join(lines[i:i+50])
+                chunk_id = f"{fpath}:{i}"
+                docs.append(chunk)
+                ids.append(chunk_id)
+                metas.append({"file": str(fpath.relative_to(path)), "line_start": i})
+        except Exception:
+            continue
+
+    if not docs:
+        return "No code files found to index."
+
+    # Upsert in batches
+    batch = 100
+    for i in range(0, len(docs), batch):
+        coll.upsert(documents=docs[i:i+batch], ids=ids[i:i+batch], metadatas=metas[i:i+batch])
+
+    return f"OK: indexed {len(docs)} chunks from {len({m['file'] for m in metas})} files."
+
+def tool_semantic_search(query: str, n_results: int = 5, directory: str = ".") -> str:
+    """Semantic search over the indexed codebase. Finds conceptually related code."""
+    try:
+        coll = _get_or_create_chroma(str(Path(directory).expanduser().resolve()))
+        results = coll.query(query_texts=[query], n_results=min(n_results, 10))
+        if not results["documents"][0]:
+            return "No results. Run index_codebase first."
+        lines = []
+        for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+            score = round(1 - dist, 3)
+            lines.append(f"\n[score={score}] {meta['file']}:{meta['line_start']}\n{doc[:300]}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: {e}. Run index_codebase first."
+
+# ── Reflexion ────────────────────────────────────────────────────────────────
+
+def _reflect_on_task(user_msg: str, assistant_reply: str, cwd: str) -> str | None:
+    """Ask the model to reflect on the just-completed task. Appends learnings to SWARM.md."""
+    # Only reflect on substantial tasks (not short questions)
+    if len(user_msg) < 30 or len(assistant_reply) < 100:
+        return None
+    try:
+        resp = client.chat.completions.create(
+            model=ORCHESTRATOR_MODEL,
+            messages=[
+                {"role": "system", "content": REFLEXION_PROMPT.format(date=datetime.now().strftime("%Y-%m-%d"))},
+                {"role": "user", "content": f"Task I was given:\n{user_msg[:500]}\n\nMy response:\n{assistant_reply[:1000]}"},
+            ],
+            temperature=0.3,
+            max_tokens=300,
+        )
+        reflection = resp.choices[0].message.content.strip()
+        if not reflection:
+            return None
+
+        # Append to SWARM.md
+        swarm_md = Path(cwd) / "SWARM.md"
+        divider = "\n\n---\n"
+        if swarm_md.exists():
+            swarm_md.write_text(swarm_md.read_text() + divider + reflection + "\n")
+        else:
+            swarm_md.write_text(f"# SwarmCoder Project Memory\n\n{reflection}\n")
+
+        return reflection
+    except Exception:
+        return None
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TOOL REGISTRY & DISPATCHER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -718,6 +851,9 @@ TOOL_MAP = {
     "inspect_agent":           tool_inspect_agent,
     "delete_agent":            tool_delete_agent,
     "agent_roundtable":        tool_agent_roundtable,
+    # Semantic search (ChromaDB)
+    "index_codebase":          tool_index_codebase,
+    "semantic_search":         tool_semantic_search,
 }
 
 TOOLS_SCHEMA = [
@@ -753,6 +889,9 @@ TOOLS_SCHEMA = [
     {"type":"function","function":{"name":"inspect_agent","description":"Show the full system prompt and details of any agent (built-in or custom).","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}},
     {"type":"function","function":{"name":"delete_agent","description":"Delete a custom agent.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}},
     {"type":"function","function":{"name":"agent_roundtable","description":"Run a MULTI-AGENT DISCUSSION where agents see each other's outputs and respond. Perfect for cross-discipline collaboration (e.g. iOS engineer + UX designer + backend dev debating an architecture). Each agent gets previous round outputs as context. Multiple rounds = deeper refinement.","parameters":{"type":"object","properties":{"agents":{"type":"array","items":{"type":"string"},"description":"List of agent names (built-in or custom) to include in roundtable"},"task":{"type":"string","description":"The topic/task all agents work on and discuss"},"rounds":{"type":"integer","default":1,"description":"Number of discussion rounds (1=each speaks once, 2=each responds to others, etc.)"},"share_context":{"type":"boolean","default":True,"description":"Whether each agent sees the others' outputs"}},"required":["agents","task"]}}},
+    # ── Semantic search (ChromaDB) ────────────────────────────────────────
+    {"type":"function","function":{"name":"index_codebase","description":"Index the entire codebase into a local vector database for semantic search. Run this once per project before using semantic_search.","parameters":{"type":"object","properties":{"directory":{"type":"string","default":"."}},"required":[]}}},
+    {"type":"function","function":{"name":"semantic_search","description":"Semantic search over the indexed codebase. Finds conceptually related code even without exact keyword match. E.g. 'authentication logic', 'database connection', 'error handling'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Natural language description of code to find"},"n_results":{"type":"integer","default":5},"directory":{"type":"string","default":"."}},"required":["query"]}}},
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS_SCHEMA}
@@ -846,6 +985,32 @@ def _parse_tool_from_text(text: str) -> list[dict]:
                                "arguments": {"name": name, **args}})
 
     return calls
+
+
+def _instructor_extract_tool(content: str) -> list[dict] | None:
+    """Layer 4: use instructor to extract tool call from unstructured text."""
+    try:
+        import instructor
+        iclient = instructor.from_openai(
+            OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY),
+            mode=instructor.Mode.JSON,
+        )
+        extraction = iclient.chat.completions.create(
+            model=ORCHESTRATOR_MODEL,
+            response_model=ToolCallExtract,
+            messages=[
+                {"role": "system", "content": f"Extract the tool call from this text. Valid tool names: {sorted(TOOL_NAMES)}"},
+                {"role": "user", "content": content},
+            ],
+            max_retries=2,
+            temperature=0,
+            max_tokens=512,
+        )
+        if extraction.name in TOOL_NAMES:
+            return [{"name": extraction.name, "arguments": extraction.arguments}]
+    except Exception:
+        pass
+    return None
 
 
 def _extract_code_blocks_and_write(text: str, cwd: str) -> list[str]:
@@ -1024,6 +1189,27 @@ def agent_turn(history: list, cwd: str = ".") -> str:
                     )
                 })
                 continue
+
+        # ── Layer 4: instructor structured extraction ──────────────────────
+        if content and len(content) > 50:  # only try if there's substantial content
+            instructor_calls = _instructor_extract_tool(content)
+            if instructor_calls:
+                print(c(DIM, f"  [tool⁴] instructor extracted: {instructor_calls[0]['name']}"), flush=True)
+                fid = f"call_{instructor_calls[0]['name']}_{iteration}_instr"
+                fake_tool_calls = [
+                    {
+                        "id": fid, "type": "function",
+                        "function": {
+                            "name": instructor_calls[0]["name"],
+                            "arguments": json.dumps(instructor_calls[0]["arguments"]),
+                        },
+                    }
+                ]
+                messages.append({"role": "assistant", "content": "", "tool_calls": fake_tool_calls})
+                result = dispatch(instructor_calls[0]["name"], instructor_calls[0]["arguments"])
+                messages.append({"role": "tool", "tool_call_id": fid, "content": result[:MAX_SHELL_CHARS]})
+                continue
+
         return content
 
     return "ERROR: reached max iterations without final reply."
@@ -1039,11 +1225,12 @@ def _print_banner():
     custom_count = len(CUSTOM_AGENTS)
     print(f"""{BOLD}{CYAN}
 ╔══════════════════════════════════════════════════╗
-║   SwarmCoder v2  —  Omnipotent Coding Agent      ║
+║   SwarmCoder v4  —  Omnipotent Coding Agent      ║
 ╚══════════════════════════════════════════════════╝{R}
 Orchestrator : {YELLOW}{ORCHESTRATOR_MODEL}{R}
 Sub-agents   : {YELLOW}{SUB_AGENT_MODEL}{R}
 Tools        : {GREEN}{len(TOOL_MAP)}{R}  Built-in agents: {GREEN}{len(AGENTS)}{R}  Custom agents: {MAGENTA}{custom_count}{R}
+Intelligence : {GREEN}instructor + reflexion + semantic RAG{R}
 {DIM}
 Commands:
   /exit            quit
@@ -1056,7 +1243,9 @@ Commands:
   /notes           list session notes
   /model NAME      switch orchestrator model
   /submodel NAME   switch sub-agent model
-  /swarm           show SWARM.md if present{R}
+  /swarm           show SWARM.md if present
+  /reflect         reflect on last exchange → update SWARM.md
+  /index           index codebase into ChromaDB for semantic search{R}
 """)
 
 
@@ -1137,6 +1326,20 @@ def main():
             else:
                 print(c(DIM, "No SWARM.md in current directory."))
             continue
+        elif raw == "/reflect":
+            if len(history) >= 2:
+                last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+                last_asst = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+                r = _reflect_on_task(last_user, last_asst, cwd)
+                print(c(MAGENTA, r or "Nothing to reflect on."))
+            else:
+                print(c(DIM, "No conversation history to reflect on."))
+            continue
+        elif raw == "/index":
+            print(c(DIM, "  Indexing codebase into ChromaDB..."), flush=True)
+            result = tool_index_codebase(cwd)
+            print(c(GREEN, f"  {result}"))
+            continue
         elif raw.startswith("/model "):
             ORCHESTRATOR_MODEL = raw[7:].strip()
             print(c(YELLOW, f"Orchestrator → {ORCHESTRATOR_MODEL}"))
@@ -1161,6 +1364,11 @@ def main():
             reply = f"ERROR: {e}"
 
         history.append({"role": "assistant", "content": reply})
+
+        # Reflexion: reflect on completed task, update SWARM.md
+        reflection = _reflect_on_task(raw, reply, cwd)
+        if reflection:
+            print(c(DIM, f"  ✦ reflexion saved to SWARM.md"), flush=True)
 
         # Auto-save every turn
         _save_history(history)

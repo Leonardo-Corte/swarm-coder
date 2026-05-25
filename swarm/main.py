@@ -12,6 +12,12 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from typing import Any
 
+try:
+    from smolagents import CodeAgent, LiteLLMModel, Tool
+    _SMOLAGENTS_OK = True
+except ImportError:
+    _SMOLAGENTS_OK = False
+
 # ── Instructor structured extraction model ──────────────────────────────────
 class ToolCallExtract(BaseModel):
     name: str = Field(description="Name of the tool to call")
@@ -1823,6 +1829,234 @@ TOOL_NAMES = {t["function"]["name"] for t in TOOLS_SCHEMA}
 # Built lazily after TOOLS_SCHEMA is complete; used by _run_agent_with_system
 SUB_AGENT_TOOLS = [t for t in TOOLS_SCHEMA if t["function"]["name"] in SUB_AGENT_TOOLS_NAMES]
 
+# ── smolagents CodeAgent (v8) ──────────────────────────────────────────────
+
+def _sa(fn, name: str, desc: str, inputs: dict):
+    """Create a smolagents Tool wrapping fn. Generates forward() with explicit named params."""
+    nullable = {k for k, v in inputs.items() if v.get("nullable")}
+    required = [k for k in inputs if k not in nullable]
+    optional = [k for k in inputs if k in nullable]
+    all_params = required + optional
+    sig = ", ".join(required + [f"{p}=None" for p in optional])
+    pairs = ", ".join(f'"{p}": {p}' for p in all_params)
+    globs: dict = {"__fn": fn}
+    exec(
+        f"def forward(self, {sig}):\n"
+        f"    kw = {{{pairs}}}\n"
+        f"    kw = {{k: v for k, v in kw.items() if v is not None}}\n"
+        f"    try:\n        return str(__fn(**kw))\n"
+        f"    except Exception as e:\n        return 'ERROR in {name}: ' + str(e)",
+        globs,
+    )
+    return type(f"_SA_{name}", (Tool,), {
+        "name": name, "description": desc,
+        "inputs": inputs, "output_type": "string", "forward": globs["forward"],
+    })()
+
+def _s(desc, nullable=False):
+    d = {"type": "string", "description": desc}
+    if nullable: d["nullable"] = True
+    return d
+
+def _i(desc, nullable=False):
+    d = {"type": "integer", "description": desc}
+    if nullable: d["nullable"] = True
+    return d
+
+def _b(desc, nullable=False):
+    d = {"type": "boolean", "description": desc}
+    if nullable: d["nullable"] = True
+    return d
+
+def _arr(desc, nullable=False):
+    d = {"type": "array", "description": desc}
+    if nullable: d["nullable"] = True
+    return d
+
+def _build_sa_tools() -> list:
+    """Build all smolagents Tool objects from existing functions."""
+    return [
+        _sa(tool_read_file, "read_file",
+            "Read a file. Returns content with line numbers. Use start_line/end_line for large files.",
+            {"path": _s("Path to the file"), "start_line": _i("First line (optional)", True), "end_line": _i("Last line (optional)", True)}),
+
+        _sa(tool_write_file, "write_file",
+            "Write (create or overwrite) a file. ALWAYS call run_shell/run_python after to verify.",
+            {"path": _s("File path"), "content": _s("Complete file content")}),
+
+        _sa(tool_edit_file, "edit_file",
+            "Surgically replace old_string with new_string. Prefer this over write_file for changes to existing files.",
+            {"path": _s("File path"), "old_string": _s("Exact text to find"), "new_string": _s("Replacement text")}),
+
+        _sa(tool_append_file, "append_file",
+            "Append content to end of a file.",
+            {"path": _s("File path"), "content": _s("Content to append")}),
+
+        _sa(tool_delete_file, "delete_file",
+            "Delete a file.",
+            {"path": _s("Path to delete")}),
+
+        _sa(tool_list_directory, "list_directory",
+            "List files and directories.",
+            {"path": _s("Directory path", True), "show_hidden": _b("Show hidden files", True)}),
+
+        _sa(tool_grep, "grep",
+            "Search for a pattern across files (like grep -rn). Returns file:line matches.",
+            {"pattern": _s("Regex or text pattern"), "path": _s("Directory", True), "file_glob": _s("File filter e.g. '*.py'", True), "case_sensitive": _b("Case sensitive", True), "context_lines": _i("Lines of context", True)}),
+
+        _sa(tool_find_files, "find_files",
+            "Find files by name/glob pattern.",
+            {"directory": _s("Root directory", True), "pattern": _s("Glob e.g. '*.py'", True)}),
+
+        _sa(tool_repo_map, "repo_map",
+            "Lightweight code map: all functions, classes, methods with line numbers.",
+            {"directory": _s("Project root", True)}),
+
+        _sa(tool_contract_map, "contract_map",
+            "Full AST contract map: public signatures, type hints, docstrings, dependencies. Call FIRST before cross-file refactoring.",
+            {"directory": _s("Project root", True)}),
+
+        _sa(tool_run_shell, "run_shell",
+            "Execute a shell command. Returns stdout + stderr + exit code. Use for tests, git, installs.",
+            {"command": _s("Shell command"), "cwd": _s("Working directory", True), "timeout": _i("Timeout seconds", True)}),
+
+        _sa(tool_run_python, "run_python",
+            "Execute Python code in subprocess. Returns output. Use for quick checks, testing snippets.",
+            {"code": _s("Python code"), "timeout": _i("Timeout seconds", True)}),
+
+        _sa(tool_git_status, "git_status",
+            "Show git status and recent log.",
+            {"path": _s("Repo path", True)}),
+
+        _sa(tool_git_diff, "git_diff",
+            "Show git diff.",
+            {"path": _s("Repo path", True), "staged": _b("Show staged diff", True)}),
+
+        _sa(tool_git_log, "git_log",
+            "Show git commit history.",
+            {"path": _s("Repo path", True), "n": _i("Number of commits", True)}),
+
+        _sa(tool_git_add, "git_add",
+            "Stage files for commit.",
+            {"files": _s("Files to stage e.g. '.' or 'src/main.py'"), "path": _s("Repo path", True)}),
+
+        _sa(tool_git_commit, "git_commit",
+            "Create a git commit.",
+            {"message": _s("Commit message"), "path": _s("Repo path", True), "add_all": _b("Stage all first", True)}),
+
+        _sa(tool_web_fetch, "web_fetch",
+            "Fetch a URL, return stripped text. Use for docs, APIs, GitHub raw files.",
+            {"url": _s("URL to fetch"), "max_chars": _i("Max chars to return", True)}),
+
+        _sa(tool_save_note, "save_note",
+            "Save a note to session memory.",
+            {"key": _s("Note key"), "content": _s("Note content")}),
+
+        _sa(tool_get_note, "get_note",
+            "Get a saved note by key.",
+            {"key": _s("Note key")}),
+
+        _sa(tool_list_notes, "list_notes",
+            "List all saved session notes.",
+            {}),
+
+        _sa(tool_analyze_project, "analyze_project",
+            "Deep project analysis: file tree, git history, config files. Call FIRST on any new project.",
+            {"directory": _s("Project directory"), "max_depth": _i("Max depth", True)}),
+
+        _sa(tool_invoke_agent, "invoke_agent",
+            "Invoke a specialized sub-agent: architect, implementer, reviewer, tester, optimizer, debugger, documenter, security.",
+            {"agent": _s("Agent name"), "task": _s("Task description"), "context": _s("Extra context", True)}),
+
+        _sa(tool_plan_project, "plan_project",
+            "ARCHITECT: produce complete project blueprint before any code. Call FIRST for multi-file projects.",
+            {"task": _s("What to build — be specific"), "directory": _s("Working directory", True)}),
+
+        _sa(tool_implement_plan, "implement_plan",
+            "EDITOR: implement the architect plan. Reads saved plan, implements file by file with verification.",
+            {"plan": _s("Plan text (optional, reads from notes)", True), "directory": _s("Working directory (optional)", True)}),
+
+        _sa(tool_best_of_n, "best_of_n",
+            "BEST-OF-N: 5 specialists compete in parallel, tests pick winner. P(correct)=99% for N=5. Use for critical tasks.",
+            {"task": _s("Coding task — be specific"), "n": _i("Parallel attempts 2-5", True), "test_command": _s("Test command to score e.g. 'pytest test.py'", True), "directory": _s("Output directory", True)}),
+
+        _sa(tool_start_debug_session, "start_debug_session",
+            "Start structured debug session with hypothesis tracking. Call FIRST when debugging.",
+            {"error_description": _s("Full error message and context"), "file_path": _s("File with bug (optional)", True)}),
+
+        _sa(tool_debug_hypothesis, "debug_hypothesis",
+            "Test a hypothesis. Returns CONFIRMED/REFUTED/INCONCLUSIVE. Detects loops.",
+            {"hypothesis": _s("'The bug is in X because Y'"), "test_command": _s("Command to test"), "expected_if_true": _s("Expected output if correct")}),
+
+        _sa(tool_extract_constraints, "extract_constraints",
+            "Extract hard/soft constraints before designing. Call first for architecture questions.",
+            {"problem_description": _s("Full problem with requirements")}),
+
+        _sa(tool_compare_architectures, "compare_architectures",
+            "Compare 2-3 architecture options against constraints. Returns scored matrix.",
+            {"options": _arr("List of 2-3 architecture options as strings"), "constraints": _s("Constraints (optional)", True)}),
+
+        _sa(tool_find_usages, "find_usages",
+            "Find all usages of a function/class/variable across the codebase.",
+            {"symbol": _s("Symbol name"), "directory": _s("Root directory", True)}),
+
+        _sa(tool_impact_analysis, "impact_analysis",
+            "Before refactoring: what breaks if you change these symbols? Returns HIGH/MEDIUM/LOW risk.",
+            {"file_path": _s("File to modify"), "symbols_to_change": _arr("List of symbol names to change")}),
+
+        _sa(tool_safe_rename, "safe_rename",
+            "Rename function/class/variable across ALL files atomically.",
+            {"old_name": _s("Current name"), "new_name": _s("New name"), "directory": _s("Project root", True)}),
+
+        _sa(tool_index_codebase, "index_codebase",
+            "Index codebase into local vector DB for semantic search. Run once per project.",
+            {"directory": _s("Project directory", True)}),
+
+        _sa(tool_semantic_search, "semantic_search",
+            "Semantic search: finds conceptually related code without exact keywords.",
+            {"query": _s("Natural language query"), "n_results": _i("Number of results", True), "directory": _s("Project directory", True)}),
+    ]
+
+def _build_sa_agent():
+    """Build the smolagents CodeAgent backed by Ollama via LiteLLM."""
+    if not _SMOLAGENTS_OK:
+        return None
+    api_base = OLLAMA_BASE_URL.replace("/v1", "").rstrip("/")
+    model = LiteLLMModel(
+        model_id=f"ollama_chat/{ORCHESTRATOR_MODEL}",
+        api_base=api_base,
+        num_ctx=16384,
+    )
+    instructions = f"""\
+{EXECUTOR_MANDATE}
+
+{COT_CODING_PROMPT}
+
+═══ WORKFLOW RULES ═══
+• Multi-file project → plan_project() THEN implement_plan() — never skip planning
+• Debugging → start_debug_session() THEN debug_hypothesis() — never guess and patch
+• Critical correctness → best_of_n(task, n=5, test_command="pytest ...")
+• After every write_file() → run_shell() or run_python() to verify
+• Refactoring → contract_map() THEN impact_analysis() THEN safe_rename()
+• Architecture question → extract_constraints() THEN compare_architectures()"""
+
+    agent = CodeAgent(
+        tools=_build_sa_tools(),
+        model=model,
+        additional_authorized_imports=["*"],
+        instructions=instructions,
+    )
+    return agent
+
+_SA_AGENT: "CodeAgent | None" = None
+
+def _get_sa_agent():
+    global _SA_AGENT
+    if _SA_AGENT is None:
+        _SA_AGENT = _build_sa_agent()
+    return _SA_AGENT
+
+
 def dispatch(name: str, args: dict) -> str:
     fn = TOOL_MAP.get(name)
     if not fn: return f"ERROR: unknown tool '{name}'"
@@ -2302,14 +2536,16 @@ def _fmt_args(args: dict) -> str:
 
 def _print_banner():
     custom_count = len(CUSTOM_AGENTS)
+    engine = f"{GREEN}smolagents CodeAgent{R}" if _SMOLAGENTS_OK else f"{YELLOW}ReAct JSON (install smolagents to upgrade){R}"
     print(f"""{BOLD}{CYAN}
 ╔══════════════════════════════════════════════════╗
-║   SwarmCoder v6  —  Omnipotent Coding Agent      ║
+║   SwarmCoder v8  —  Omnipotent Coding Agent      ║
 ╚══════════════════════════════════════════════════╝{R}
 Orchestrator : {YELLOW}{ORCHESTRATOR_MODEL}{R}
 Sub-agents   : {YELLOW}{SUB_AGENT_MODEL}{R}
 Tools        : {GREEN}{len(TOOL_MAP)}{R}  Built-in agents: {GREEN}{len(AGENTS)}{R}  Custom agents: {MAGENTA}{custom_count}{R}
-Intelligence : {GREEN}architect + hypothesis debugger + constraint reasoning + dependency graph + intent router{R}
+Engine       : {engine}
+Intelligence : {GREEN}CodeAgent + best-of-N + chain-of-thought + architect + debugger + RAG{R}
 {DIM}
 Commands:
   /exit            quit
@@ -2348,10 +2584,23 @@ def main():
         print(c(RED, f"Run: ollama serve\n({e})"))
         sys.exit(1)
 
-    # Load history
+    # Initialize smolagents CodeAgent (lazy — first call may take a moment)
+    global _SA_AGENT
+    if _SMOLAGENTS_OK:
+        print(c(DIM, "  ⚙ initializing CodeAgent..."), end="", flush=True)
+        try:
+            _SA_AGENT = _build_sa_agent()
+            print(c(GREEN, " ready"))
+        except Exception as e:
+            print(c(YELLOW, f" failed ({e}), falling back to ReAct JSON"))
+            _SA_AGENT = None
+    else:
+        print(c(YELLOW, "  ⚠ smolagents not installed — using ReAct JSON mode (pip install 'smolagents[litellm]')"))
+
+    # Load history (used by fallback ReAct mode)
     history = _load_history()
     if history:
-        print(c(DIM, f"  ↩ {len(history)} messages from last session loaded (/clear to reset)"))
+        print(c(DIM, f"  ↩ {len(history)} messages from last session (/clear to reset)"))
     print()
 
     while True:
@@ -2373,6 +2622,9 @@ def main():
         elif raw == "/clear":
             history.clear()
             _save_history(history)
+            if _SA_AGENT is not None:
+                # Reinitialize agent to clear its memory
+                _SA_AGENT = _build_sa_agent()
             print(c(YELLOW, "History cleared."))
             continue
         elif raw == "/resume":
@@ -2429,28 +2681,32 @@ def main():
             continue
 
         # ── Agent turn ─────────────────────────────────────────────────────
-        history.append({"role": "user", "content": raw})
         print(f"\n{c(CYAN,'SwarmCoder')} {c(DIM,'...')}", flush=True)
 
         try:
-            reply = agent_turn(history, cwd=cwd)
+            if _SA_AGENT is not None:
+                # ── v8: smolagents CodeAgent ──────────────────────────────
+                # Inject cwd context into the task so agent knows where it is
+                task_with_ctx = f"[cwd: {cwd}]\n{raw}"
+                reply = str(_SA_AGENT.run(task_with_ctx, reset_memory=False))
+            else:
+                # ── Fallback: ReAct JSON tool calling ─────────────────────
+                history.append({"role": "user", "content": raw})
+                reply = agent_turn(history, cwd=cwd)
+                history.append({"role": "assistant", "content": reply})
+                _save_history(history)
+
         except KeyboardInterrupt:
             print(c(YELLOW, "\n[interrupted]"))
-            history.pop()  # remove unanswered user message
             continue
         except Exception as e:
             import traceback; traceback.print_exc()
             reply = f"ERROR: {e}"
 
-        history.append({"role": "assistant", "content": reply})
-
         # Reflexion: reflect on completed task, update SWARM.md
         reflection = _reflect_on_task(raw, reply, cwd)
         if reflection:
             print(c(DIM, f"  ✦ reflexion saved to SWARM.md"), flush=True)
-
-        # Auto-save every turn
-        _save_history(history)
 
         print(f"\n{BOLD}{CYAN}swarm >{R}\n{reply}")
         print(c(DIM, "─" * 60 + "\n"))

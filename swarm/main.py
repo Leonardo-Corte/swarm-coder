@@ -74,6 +74,54 @@ def c(col,t): return f"{col}{t}{R}"
 # ── Session memory (in-memory, survives within one run) ───────────────────
 _NOTES: dict[str, str] = {}
 
+# ── Hypothesis Debugger ────────────────────────────────────────────────────
+
+class HypothesisTracker:
+    """Tracks debugging hypotheses and detects infinite loops."""
+
+    def __init__(self):
+        self.entries: list[dict] = []  # {hypothesis, test, result, confirmed}
+        self.session_id: str = datetime.now().strftime("%H%M%S")
+
+    def add(self, hypothesis: str, test_command: str, result: str, confirmed: bool | None = None):
+        self.entries.append({
+            "hypothesis": hypothesis,
+            "test": test_command,
+            "result": result[:500],
+            "confirmed": confirmed,
+        })
+
+    def is_looping(self) -> bool:
+        """Detect if we're stuck: same result 3 times in a row."""
+        if len(self.entries) < 3:
+            return False
+        last3_results = [e["result"][:100] for e in self.entries[-3:]]
+        return len(set(last3_results)) == 1
+
+    def tried_hypothesis(self, hypothesis: str) -> bool:
+        """Check if a similar hypothesis was already tried."""
+        h_lower = hypothesis.lower()
+        return any(
+            h_lower in e["hypothesis"].lower() or e["hypothesis"].lower() in h_lower
+            for e in self.entries
+        )
+
+    def summary(self) -> str:
+        if not self.entries:
+            return "No hypotheses tried yet."
+        lines = [f"Debug session {self.session_id} ({len(self.entries)} attempts):"]
+        for i, e in enumerate(self.entries, 1):
+            status = "✓" if e["confirmed"] else ("✗" if e["confirmed"] is False else "?")
+            lines.append(f"  {i}. [{status}] {e['hypothesis'][:80]}")
+        return "\n".join(lines)
+
+    def reset(self):
+        self.entries.clear()
+        self.session_id = datetime.now().strftime("%H%M%S")
+
+# Module-level tracker instance
+_DEBUG_TRACKER = HypothesisTracker()
+
 # ── Built-in sub-agent personas ────────────────────────────────────────────
 AGENTS = {
     "architect":   "You are an elite software architect. Produce clear implementation plans: components, interfaces, file structure, ordered steps. Save your plan with save_note(). Be decisive and specific.",
@@ -910,6 +958,105 @@ Do NOT deviate from the plan's interfaces — other files depend on them."""
     return result
 
 
+# ── Hypothesis Debugger tools ────────────────────────────────────────────────
+
+def tool_start_debug_session(error_description: str, file_path: str = "") -> str:
+    """
+    Start a structured debugging session. Resets hypothesis tracker.
+    Call this at the beginning of ANY debugging task.
+    Returns initial analysis + prompt for first hypothesis.
+    """
+    global _DEBUG_TRACKER
+    _DEBUG_TRACKER.reset()
+
+    context = ""
+    if file_path and Path(file_path).exists():
+        context = f"\n\nFile content:\n{tool_read_file(file_path)[:3000]}"
+
+    print(c(MAGENTA, "  ✦ debug session started"), flush=True)
+    return (
+        f"Debug session started. Tracker reset.\n"
+        f"Error: {error_description}{context}\n\n"
+        f"NEXT STEP: Formulate a FALSIFIABLE hypothesis and call debug_hypothesis().\n"
+        f"A good hypothesis: 'The bug is in [specific location] because [specific reason]'\n"
+        f"A bad hypothesis: 'Something is wrong somewhere'"
+    )
+
+
+def tool_debug_hypothesis(hypothesis: str, test_command: str, expected_if_true: str) -> str:
+    """
+    Test a specific debugging hypothesis.
+    - hypothesis: "The bug is in X because Y"
+    - test_command: shell command or python code to run that tests this hypothesis
+    - expected_if_true: what output/behavior would confirm the hypothesis
+
+    Returns: CONFIRMED / REFUTED / INCONCLUSIVE + next action
+    """
+    global _DEBUG_TRACKER
+
+    # Check for loop
+    if _DEBUG_TRACKER.is_looping():
+        return (
+            "⚠️  LOOP DETECTED: Same result 3 times in a row.\n"
+            f"{_DEBUG_TRACKER.summary()}\n\n"
+            "REQUIRED: Change strategy completely. Try:\n"
+            "  1. Add print/logging at a DIFFERENT location\n"
+            "  2. Simplify the failing code to minimum reproducer\n"
+            "  3. Check if the bug is in INPUTS not the function itself\n"
+            "  4. Call start_debug_session() to reset if needed"
+        )
+
+    # Check if hypothesis already tried
+    if _DEBUG_TRACKER.tried_hypothesis(hypothesis):
+        return (
+            f"⚠️  Similar hypothesis already tried:\n{_DEBUG_TRACKER.summary()}\n\n"
+            "Formulate a DIFFERENT hypothesis — focus on a different component or cause."
+        )
+
+    print(c(DIM, f"  [debug] testing: {hypothesis[:60]}..."), flush=True)
+
+    # Run the test
+    result = tool_run_shell(test_command) if test_command.strip() else "No test command provided."
+
+    # Determine if confirmed/refuted
+    result_lower = result.lower()
+    expected_lower = expected_if_true.lower()
+
+    # Simple heuristic: check if key words from expected appear in result
+    expected_words = [w for w in expected_lower.split() if len(w) > 4]
+    matches = sum(1 for w in expected_words if w in result_lower)
+    ratio = matches / max(len(expected_words), 1)
+
+    if "error" in result_lower and "error" not in expected_lower:
+        confirmed = False
+        verdict = "REFUTED — test produced an unexpected error"
+    elif ratio >= 0.5:
+        confirmed = True
+        verdict = "CONFIRMED — output matches expected behavior"
+    else:
+        confirmed = None
+        verdict = "INCONCLUSIVE — output doesn't clearly confirm or refute"
+
+    _DEBUG_TRACKER.add(hypothesis, test_command, result, confirmed)
+
+    output = [
+        f"Hypothesis: {hypothesis}",
+        f"Test ran: {test_command}",
+        f"Result: {result[:800]}",
+        f"\nVerdict: {verdict}",
+        f"\nProgress: {_DEBUG_TRACKER.summary()}",
+    ]
+
+    if confirmed:
+        output.append("\n✅ Hypothesis CONFIRMED. Now apply the targeted fix with edit_file(). Then verify with the same test command.")
+    elif confirmed is False:
+        output.append("\n❌ Hypothesis REFUTED. Formulate a NEW hypothesis about a different cause/location.")
+    else:
+        output.append("\n⚠️ INCONCLUSIVE. Either: refine the test to be more specific, OR try a different hypothesis.")
+
+    return "\n".join(output)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TOOL REGISTRY & DISPATCHER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -961,6 +1108,9 @@ TOOL_MAP = {
     # Architect mode
     "plan_project":            tool_plan_project,
     "implement_plan":          tool_implement_plan,
+    # Hypothesis Debugger
+    "start_debug_session":     tool_start_debug_session,
+    "debug_hypothesis":        tool_debug_hypothesis,
 }
 
 TOOLS_SCHEMA = [
@@ -1002,6 +1152,9 @@ TOOLS_SCHEMA = [
     # ── Architect mode ────────────────────────────────────────────────────
     {"type":"function","function":{"name":"plan_project","description":"ARCHITECT PHASE: Produce a complete project blueprint BEFORE writing any code. Lists all files, function signatures, imports, and implementation order. Call this first for ANY multi-file project, then call implement_plan() to execute.","parameters":{"type":"object","properties":{"task":{"type":"string","description":"What to build — be specific and complete"},"directory":{"type":"string","default":".","description":"Working directory"}},"required":["task"]}}},
     {"type":"function","function":{"name":"implement_plan","description":"EDITOR PHASE: Implement the architect plan from plan_project(). Reads the saved plan and implements each file in order, verifying each one works. Call this after plan_project().","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"The plan text (optional — if empty, reads from session notes set by plan_project)"},"directory":{"type":"string","description":"Working directory (optional — reads from session notes if empty)"}},"required":[]}}},
+    # ── Hypothesis Debugger ───────────────────────────────────────────────
+    {"type":"function","function":{"name":"start_debug_session","description":"Start a structured debugging session with hypothesis tracking. ALWAYS call this first when debugging an error. Resets the hypothesis tracker and provides initial analysis.","parameters":{"type":"object","properties":{"error_description":{"type":"string","description":"Full error message and context"},"file_path":{"type":"string","description":"Path to the file with the bug (optional)"}},"required":["error_description"]}}},
+    {"type":"function","function":{"name":"debug_hypothesis","description":"Test a specific debugging hypothesis with a concrete test. Tracks all attempts, detects infinite loops, and tells you if the hypothesis is CONFIRMED/REFUTED/INCONCLUSIVE. Only apply a fix after CONFIRMED.","parameters":{"type":"object","properties":{"hypothesis":{"type":"string","description":"Falsifiable hypothesis: 'The bug is in X because Y'"},"test_command":{"type":"string","description":"Shell command or test to run that validates this hypothesis"},"expected_if_true":{"type":"string","description":"What output/behavior would CONFIRM the hypothesis"}},"required":["hypothesis","test_command","expected_if_true"]}}},
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS_SCHEMA}
@@ -1188,6 +1341,11 @@ Orchestrator: {ORCHESTRATOR_MODEL} | Sub-agents: {SUB_AGENT_MODEL} | Date: {toda
 6. EDITING → ALWAYS prefer edit_file (surgical) over write_file (full rewrite).
 7. VERIFICATION → after writing code, run it with run_python or run_shell.
 8. GIT → commit progress at logical milestones with git_commit.
+9. DEBUGGING → ALWAYS use structured protocol:
+   a. start_debug_session(error) — initialize tracker
+   b. debug_hypothesis(hypothesis, test, expected) — test each theory
+   c. NEVER apply a fix before hypothesis is CONFIRMED
+   d. NEVER repeat same hypothesis — tracker prevents this
 
 ═══ AGENT SYSTEM ═══
 DYNAMIC AGENT FACTORY:
@@ -1245,8 +1403,33 @@ Chain as many tool calls as needed. Give final response as plain text when done.
 
 def agent_turn(history: list, cwd: str = ".") -> str:
     messages = [{"role": "system", "content": _build_system_prompt(cwd)}] + history
+    _recent_calls: list = [()]  # track last 6 sets of tool calls for loop detection (seed with empty)
 
     for iteration in range(MAX_ITERATIONS):
+        # ── Loop detection (start of iteration) ───────────────────────────
+        if _recent_calls:
+            last_msg = messages[-1] if messages else {}
+            current_calls = tuple(
+                (tc["function"]["name"], tc["function"]["arguments"][:100])
+                for tc in last_msg.get("tool_calls", [])
+            ) if last_msg.get("role") == "assistant" else ()
+            _recent_calls.append(current_calls)
+            if len(_recent_calls) > 6:
+                _recent_calls.pop(0)
+            if len(_recent_calls) >= 3 and _recent_calls[-1] == _recent_calls[-2] == _recent_calls[-3] and _recent_calls[-1]:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "⚠️ LOOP DETECTED: You have called the same tool(s) with the same arguments "
+                        "3 times in a row without making progress. STOP and change strategy:\n"
+                        "1. If debugging: call start_debug_session() and try a different approach\n"
+                        "2. If stuck on a file: read it again with read_file() to verify current state\n"
+                        "3. If a command keeps failing: try a different command\n"
+                        "4. If truly stuck: summarize what you tried and ask for direction"
+                    )
+                })
+                _recent_calls.clear()
+
         resp = client.chat.completions.create(
             model=ORCHESTRATOR_MODEL,
             messages=messages,
@@ -1353,7 +1536,7 @@ def _print_banner():
 Orchestrator : {YELLOW}{ORCHESTRATOR_MODEL}{R}
 Sub-agents   : {YELLOW}{SUB_AGENT_MODEL}{R}
 Tools        : {GREEN}{len(TOOL_MAP)}{R}  Built-in agents: {GREEN}{len(AGENTS)}{R}  Custom agents: {MAGENTA}{custom_count}{R}
-Intelligence : {GREEN}instructor + reflexion + semantic RAG + architect mode{R}
+Intelligence : {GREEN}instructor + reflexion + RAG + architect + hypothesis debugger{R}
 {DIM}
 Commands:
   /exit            quit

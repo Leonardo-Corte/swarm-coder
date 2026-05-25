@@ -17,6 +17,58 @@ class ToolCallExtract(BaseModel):
     name: str = Field(description="Name of the tool to call")
     arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
 
+class _ReadFileArgs(BaseModel):
+    path: str
+
+class _RunShellArgs(BaseModel):
+    command: str
+    cwd: str | None = None
+    timeout: int = 60
+
+class _WriteFileArgs(BaseModel):
+    path: str
+    content: str
+
+class _GrepArgs(BaseModel):
+    pattern: str
+    path: str = "."
+
+class _GitStatusArgs(BaseModel):
+    path: str = "."
+
+_CONSTRAINED_TOOL_SCHEMAS: dict[str, type] = {
+    "read_file":  _ReadFileArgs,
+    "run_shell":  _RunShellArgs,
+    "write_file": _WriteFileArgs,
+    "grep":       _GrepArgs,
+    "git_status": _GitStatusArgs,
+}
+
+_INTENT_PRIMERS: list[tuple[tuple[str, ...], str, dict]] = [
+    (("leggi", "read", "apri", "open", "show", "mostra", "visualizza", "cat"),
+     "read_file", {"path": "<file_path>"}),
+    (("scrivi", "write", "crea file", "create file", "salva", "save", "genera file"),
+     "write_file", {"path": "<file_path>", "content": "<content>"}),
+    (("esegui", "run", "execute", "bash", "shell", "lancia", "avvia comando"),
+     "run_shell", {"command": "<command>"}),
+    (("cerca", "grep", "search", "trova pattern", "find pattern"),
+     "grep", {"pattern": "<pattern>", "path": "."}),
+    (("git status", "stato git", "git diff", "modifiche git"),
+     "git_status", {"path": "."}),
+    (("analizza progetto", "analyze project", "analizza repo"),
+     "analyze_project", {"directory": "."}),
+    (("refactor", "rinomina", "rename", "safe rename", "cambia nome"),
+     "contract_map", {"directory": "."}),
+    (("indicizza", "index codebase", "index project"),
+     "index_codebase", {"directory": "."}),
+    (("cerca semantica", "semantic search", "trova concettualmente"),
+     "semantic_search", {"query": "<query>"}),
+    (("pianifica", "plan project", "architect", "struttura progetto"),
+     "plan_project", {"task": "<task_description>"}),
+    (("debug", "debugga", "errore", "exception", "traceback", "crash"),
+     "start_debug_session", {"error_description": "<error>"}),
+]
+
 # ── Config ─────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL    = os.environ.get("SWARM_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_API_KEY     = os.environ.get("SWARM_API_KEY", "ollama")
@@ -1703,6 +1755,59 @@ def _parse_tool_from_text(text: str) -> list[dict]:
     return calls
 
 
+def _detect_intent_primer(user_message: str) -> str | None:
+    """
+    Detect the most likely intended tool from the user message and return
+    an XML one-shot example to inject before the API call.
+    Primes the model to output the correct tool call format.
+    """
+    msg_lower = user_message.lower()
+    for keywords, tool_name, example_args in _INTENT_PRIMERS:
+        if any(kw in msg_lower for kw in keywords):
+            args = dict(example_args)
+            path_match = re.search(
+                r'[\w./\-_~]+\.(?:py|js|ts|go|rs|sh|json|yaml|toml|md|txt|csv)',
+                user_message
+            )
+            if path_match and "path" in args:
+                args["path"] = path_match.group(0)
+            quoted = re.findall(r'"([^"]{3,60})"', user_message)
+            if quoted:
+                for key in ("query", "pattern", "command"):
+                    if key in args and str(args[key]).startswith("<"):
+                        args[key] = quoted[0]
+            args_json = json.dumps(args, ensure_ascii=False)
+            return (
+                f"\n\n[EXAMPLE — use this exact format]\n"
+                f"<tool_call>{{\"name\": \"{tool_name}\", \"arguments\": {args_json}}}</tool_call>"
+            )
+    return None
+
+
+def _try_constrained_call(tool_name: str, messages: list) -> dict | None:
+    """Layer 5: instructor+Pydantic constrained call for common tools."""
+    model_cls = _CONSTRAINED_TOOL_SCHEMAS.get(tool_name)
+    if not model_cls:
+        return None
+    try:
+        import instructor
+        iclient = instructor.from_openai(
+            OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY),
+            mode=instructor.Mode.JSON,
+        )
+        result = iclient.chat.completions.create(
+            model=SUB_AGENT_MODEL,
+            response_model=model_cls,
+            messages=messages[-3:],
+            temperature=0,
+            max_tokens=512,
+            max_retries=1,
+        )
+        return {"name": tool_name, "arguments": result.model_dump(exclude_none=True)}
+    except Exception:
+        return None
+
+
 def _instructor_extract_tool(content: str) -> list[dict] | None:
     """Layer 4: use instructor to extract tool call from unstructured text."""
     try:
@@ -1877,6 +1982,20 @@ def agent_turn(history: list, cwd: str = ".") -> str:
     messages = [{"role": "system", "content": _build_system_prompt(cwd)}] + history
     _recent_calls: list = [()]  # track last 6 sets of tool calls for loop detection (seed with empty)
 
+    # ── Intent primer injection ───────────────────────────────────────────
+    _primer_injected_tool: str | None = None
+    if messages and messages[-1]["role"] == "user":
+        last_content = messages[-1]["content"]
+        primer = _detect_intent_primer(last_content)
+        if primer:
+            primer_match = re.search(r'"name":\s*"(\w+)"', primer)
+            if primer_match:
+                _primer_injected_tool = primer_match.group(1)
+            messages = messages[:-1] + [{
+                "role": "user",
+                "content": last_content + primer,
+            }]
+
     for iteration in range(MAX_ITERATIONS):
         # ── Loop detection (start of iteration) ───────────────────────────
         if _recent_calls:
@@ -1949,6 +2068,24 @@ def agent_turn(history: list, cwd: str = ".") -> str:
                 messages.append({"role":"tool","tool_call_id":ftc["id"],"content":result[:MAX_SHELL_CHARS]})
             continue
 
+        # ── Layer 3b: Constrained call if intent was primed ──────────────
+        if _primer_injected_tool and content and len(content) > 20:
+            constrained = _try_constrained_call(_primer_injected_tool, messages)
+            if constrained and constrained["name"] in TOOL_NAMES:
+                print(c(DIM, f"  [tool⁵] constrained: {constrained['name']}({_fmt_args(constrained['arguments'])})"), flush=True)
+                fid = f"call_constrained_{iteration}"
+                messages.append({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": fid, "type": "function",
+                                    "function": {"name": constrained["name"],
+                                                 "arguments": json.dumps(constrained["arguments"])}}],
+                })
+                result = dispatch(constrained["name"], constrained["arguments"])
+                messages.append({"role": "tool", "tool_call_id": fid,
+                                  "content": result[:MAX_SHELL_CHARS]})
+                _primer_injected_tool = None
+                continue
+
         # ── Layer 3: Plain text reply ─────────────────────────────────────
         # If the model outputted code in markdown instead of using write_file,
         # auto-extract and write those files, then continue the loop.
@@ -2003,12 +2140,12 @@ def _print_banner():
     custom_count = len(CUSTOM_AGENTS)
     print(f"""{BOLD}{CYAN}
 ╔══════════════════════════════════════════════════╗
-║   SwarmCoder v5  —  Omnipotent Coding Agent      ║
+║   SwarmCoder v6  —  Omnipotent Coding Agent      ║
 ╚══════════════════════════════════════════════════╝{R}
 Orchestrator : {YELLOW}{ORCHESTRATOR_MODEL}{R}
 Sub-agents   : {YELLOW}{SUB_AGENT_MODEL}{R}
 Tools        : {GREEN}{len(TOOL_MAP)}{R}  Built-in agents: {GREEN}{len(AGENTS)}{R}  Custom agents: {MAGENTA}{custom_count}{R}
-Intelligence : {GREEN}architect + hypothesis debugger + constraint reasoning + dependency graph{R}
+Intelligence : {GREEN}architect + hypothesis debugger + constraint reasoning + dependency graph + intent router{R}
 {DIM}
 Commands:
   /exit            quit

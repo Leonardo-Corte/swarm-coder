@@ -1,0 +1,24 @@
+# SWARM.md — Project Memory
+# Copy this file into your project root as SWARM.md and fill it in.
+# SwarmCoder reads it automatically at startup.
+
+## Project
+Name:
+Description:
+Stack:
+
+## Current goal
+<!-- What are we trying to build/fix right now? -->
+
+## Architecture decisions
+<!-- Key decisions already made -->
+
+## Active agents for this project
+<!-- Custom agents created for this project -->
+<!-- Example: ios_llm_engineer, ux_funnel_designer -->
+
+## Off-limits
+<!-- What NOT to touch -->
+
+## Key file paths
+<!-- Most important files the agent should know about -->

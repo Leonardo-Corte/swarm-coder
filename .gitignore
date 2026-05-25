@@ -1,0 +1,18 @@
+# Dependencies — too large to commit
+venv/
+node_modules/
+
+# Reference repos (cloned locally for pattern extraction)
+aider/
+Qwen-Agent/
+SWE-agent/
+qwen-code/
+
+# Personal session data
+~/.swarm_history.json
+~/.swarm_agents.json
+*.pyc
+__pycache__/
+.DS_Store
+.env
+*.log
